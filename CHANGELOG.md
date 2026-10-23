@@ -32,6 +32,25 @@ uses semantic-ish versioning (minor = new skill or new capability, patch = fixes
 
 ### Added
 
+- **`dspy-gepa` streams and can climb.** Runs now stream
+  `dspy-gepa/events.jsonl`, a live `run-state.json` (`status: running` plus the
+  current `phase`), and `best-so-far.json` instead of writing everything at the
+  end; `--progress` prints live lines and `touch dspy-gepa/STOP` stops a run
+  gracefully. Climb controls: `--rounds`/`--min-round-gain` (each round in its
+  own resume log), `--seed-instructions`, `--stop-after-stale`,
+  `--stop-at-score`, `--max-minutes`, `--proposals-per-iteration`, and
+  `--proposer-skill`/`--proposer-note`/`--proposer-max-chars`, all hash-bound
+  into the resume config. Spend: `--reflection-max-tokens`, reflection prices,
+  repeatable `--model-price`, `--prices-from-gateway auto|off|require` for
+  gateway-routed roles, and an observe-only `--no-spend-ledger` for plain
+  sample runs. `--evaluate-holdout` scores baseline and optimized once after
+  `candidate.json` is frozen and writes `dspy-gepa/holdout-evaluation.json`;
+  `--match-mode case-insensitive` fixes a metric trap found in a live run,
+  where exact match read 29.4% to 77.9% on a task whose baseline was already
+  88.2% once casing was ignored. Holdout results always report both scores.
+  Candidates record the evolved instruction text, `instructions_changed`,
+  `gepa_stats`, rounds, and search settings. Measured results and the flag
+  map are in `docs/dspy-gepa-hill-climbing.md`.
 - **Trace-level hosted capture exports.** `understudy traces export <trace-id>`
   calls the customer trace request-ID lookup and hands every returned ID to the
   existing resumable request capture exporter. Explicit `--trace-ids-file`
@@ -164,6 +183,19 @@ uses semantic-ish versioning (minor = new skill or new capability, patch = fixes
 
 ### Changed
 
+- **`dspy-gepa` runs on DSPy 3.4.1 and GEPA 0.1.4.** The v2 runtime now pins
+  `dspy==3.4.1`, `gepa[dspy]==0.1.4`, and `cloudpickle==3.1.2` with a bounded
+  `litellm>=1.83,<2` on Python 3.13, and records all four in its package
+  receipt. Spend is metered at DSPy's engine seam (`complete(Request)`), which
+  survives DSPy 3.5's removal of `BaseLM.forward()` overrides; zero input and
+  zero output usage fails closed as missing usage, a budget or usage failure
+  that DSPy wraps is still reported as `budget-blocked` or
+  `spend-evidence-error`, and no later call in that run reaches a provider. The
+  student `--max-tokens` default rises from 256 to 2048 and reflection gets its
+  own `--reflection-max-tokens` (default 2048): a 256-token reflection cap
+  truncated GEPA's JSON proposals and silently left the seed prompt unchanged.
+  Because the ledger reserves each call's full output cap, default runs need a
+  larger `--budget-usd`.
 - **`check-routing-health` now leads with the new reporting endpoints.**
   The skill's primary path is one org-wide grounding call to
   `/admin/v1/orgs/:org_id/reporting` (usage/cost series across all projects,
