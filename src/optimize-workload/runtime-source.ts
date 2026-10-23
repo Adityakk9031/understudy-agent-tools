@@ -160,6 +160,45 @@ def usage_token_count(usage: Any, *names: str) -> int | None:
     return None
 
 
+def usage_detail_count(usage: Any, container: str, name: str) -> int | None:
+    """Read a nested counter such as completion_tokens_details.reasoning_tokens."""
+    nested = usage.get(container) if isinstance(usage, dict) else getattr(usage, container, None)
+    return usage_token_count(nested, name) if nested is not None else None
+
+
+def billable_usage_bound(usage: Any, input_tokens: int, output_tokens: int) -> tuple[int, int, int]:
+    """Conservative (input, output, exceed-check output) token counts for settling a call.
+
+    lm15 Usage counters are provider-verbatim: output_tokens excludes reasoning on
+    Gemini and xAI, total_tokens may add reasoning or cache classes, and Anthropic
+    input_tokens excludes cache writes. The settle bound therefore takes the larger
+    of output and total - input, adds a separately reported reasoning count when the
+    total says nothing more (lm15 fills an unreported total as input + output, so an
+    equal total counts as unreported), and adds reported cache writes to the input.
+    The exceed check uses output or total - input only: OpenAI already counts
+    reasoning inside completion_tokens.
+    """
+    total = usage_token_count(usage, "total_tokens")
+    reasoning = (
+        usage_token_count(usage, "reasoning_tokens")
+        or usage_detail_count(usage, "completion_tokens_details", "reasoning_tokens")
+        or usage_detail_count(usage, "output_tokens_details", "reasoning_tokens")
+        or 0
+    )
+    cache_write = (
+        usage_token_count(usage, "cache_write_tokens", "cache_creation_input_tokens")
+        or usage_detail_count(usage, "prompt_tokens_details", "cache_write_tokens")
+        or 0
+    )
+    if total is not None and total > input_tokens + output_tokens:
+        checked_output = total - input_tokens
+        billable_output = checked_output
+    else:
+        checked_output = output_tokens
+        billable_output = output_tokens + reasoning
+    return input_tokens + cache_write, billable_output, checked_output
+
+
 def write_owner_only_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.parent.chmod(0o700)
@@ -843,29 +882,34 @@ class SpendLedger:
         output_token_ceiling: int,
         call_identity: Mapping[str, Any] | None = None,
     ) -> int:
-        if self.enforce and self.failure is not None:
-            # Fail closed for the rest of the run: once a call was blocked or
-            # returned unusable usage, no later call may reach a provider, even
-            # if an evaluator swallowed the first error and kept going.
-            raise type(self.failure)(str(self.failure))
         role = str((call_identity or {}).get("role") or "student")
         model = (call_identity or {}).get("requested_model")
         prices = self.prices_for(model, role)
-        if prices is None and self.enforce:
-            error = SpendEvidenceError("no-price-basis-for-model")
-            self._fail(error)
-            raise error
         projected = (
             token_price(input_token_ceiling, output_token_ceiling, prices[0], prices[1])
             if prices is not None
             else 0.0
         )
         blocked_event: dict[str, Any] | None = None
+        blocked_error: SpendBudgetExceeded | None = None
         call_id = 0
-        # Check and reserve under one lock so concurrent calls cannot both pass the cap.
+        # Read the latch, check the cap, and reserve under one lock, and latch a
+        # refusal before releasing it, so no concurrent call can slip past either.
+        # The lock is not reentrant: nothing in this block may take it again.
         with self._lock:
+            if self.enforce and self.failure is not None:
+                # Fail closed for the rest of the run: once a call was blocked or
+                # returned unusable usage, no later call may reach a provider, even
+                # if an evaluator swallowed the first error and kept going.
+                raise type(self.failure)(str(self.failure))
+            if prices is None and self.enforce:
+                error = SpendEvidenceError("no-price-basis-for-model")
+                self._fail(error)
+                raise error
             next_total = self.reserved_upper_bound_usd + projected
             if self.enforce and next_total > float(self.budget_usd) + 1e-12:
+                blocked_error = SpendBudgetExceeded("next-call-reservation-exceeds-budget")
+                self._fail(blocked_error)
                 blocked_event = {
                     "event": "budget-blocked",
                     "role": role,
@@ -896,11 +940,9 @@ class SpendLedger:
                     canonical_json_bytes(identity)
                     entry["configured_identity"] = identity
                 self.entries.append(entry)
-        if blocked_event is not None:
-            error = SpendBudgetExceeded("next-call-reservation-exceeds-budget")
-            self._fail(error)
+        if blocked_event is not None and blocked_error is not None:
             self._notify(blocked_event)
-            raise error
+            raise blocked_error
         return call_id
 
     def mark_error(self, call_id: int) -> None:
@@ -914,6 +956,11 @@ class SpendLedger:
         usage = response.get("usage") if isinstance(response, Mapping) else getattr(response, "usage", None)
         input_tokens = usage_token_count(usage, "prompt_tokens", "input_tokens")
         output_tokens = usage_token_count(usage, "completion_tokens", "output_tokens")
+        billable: tuple[int, int, int] | None = (
+            billable_usage_bound(usage, input_tokens, output_tokens)
+            if input_tokens is not None and output_tokens is not None
+            else None
+        )
         error: SpendEvidenceError | None = None
         with self._lock:
             entry = self.entries[call_id - 1]
@@ -923,6 +970,7 @@ class SpendLedger:
             if (
                 input_tokens is None
                 or output_tokens is None
+                or billable is None
                 or (input_tokens == 0 and output_tokens == 0)
             ):
                 entry["status"] = "usage-missing"
@@ -931,32 +979,42 @@ class SpendLedger:
                     error = SpendEvidenceError("provider-usage-missing")
             elif self.enforce and (
                 input_tokens > int(entry["input_token_ceiling"])
-                or output_tokens > int(entry["output_token_ceiling"])
+                or billable[2] > int(entry["output_token_ceiling"])
             ):
                 entry["status"] = "usage-exceeds-reservation"
                 self.usage_complete = False
                 error = SpendEvidenceError("provider-usage-exceeds-reservation")
             else:
                 attributed = None
+                settled = None
                 if entry["input_usd_per_million"] is not None and entry["output_usd_per_million"] is not None:
-                    attributed = token_price(
-                        input_tokens,
-                        output_tokens,
-                        float(entry["input_usd_per_million"]),
-                        float(entry["output_usd_per_million"]),
-                    )
+                    input_price = float(entry["input_usd_per_million"])
+                    output_price = float(entry["output_usd_per_million"])
+                    # Attribution prices the reported counters; the settled bound
+                    # prices the conservative billable counters, capped at what was
+                    # reserved. The cap only binds when enforced, where the checks
+                    # above keep the reported usage inside the reservation.
+                    attributed = token_price(input_tokens, output_tokens, input_price, output_price)
+                    settled = token_price(billable[0], billable[1], input_price, output_price)
+                    if self.enforce:
+                        settled = min(float(entry["reserved_upper_bound_usd"]), settled)
+                        attributed = min(attributed, settled)
                     self.attributed_cost_usd += attributed
-                    # Usage is known and within the reservation, so release the unused
-                    # part. In-flight calls and calls with missing or ambiguous usage
-                    # keep their full worst-case reservation, so the total stays an
-                    # upper bound. Holding every completed call at its output cap
-                    # overstated spend about 26x on a 4,096-token student cap.
-                    self.reserved_upper_bound_usd -= float(entry["reserved_upper_bound_usd"]) - attributed
+                    # Usage is known and within the reservation, so release the part
+                    # the billable bound does not need. In-flight calls and calls with
+                    # missing or ambiguous usage keep their full worst-case
+                    # reservation, so the total stays an upper bound. Holding every
+                    # completed call at its output cap overstated spend about 26x on
+                    # a 4,096-token student cap.
+                    self.reserved_upper_bound_usd -= float(entry["reserved_upper_bound_usd"]) - settled
                 entry.update({
                     "status": "complete",
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
+                    "billable_input_tokens": billable[0],
+                    "billable_output_tokens": billable[1],
                     "attributed_cost_usd": attributed,
+                    "settled_upper_bound_usd": settled,
                     "response_identity": response_identity_receipt(response),
                 })
                 self.calls_completed += 1
@@ -1026,7 +1084,7 @@ class SpendLedger:
                 ),
                 "gateway_price_lookup": self.price_lookup,
                 "reservations_are_cumulative": False,
-                "reservation_policy": "settle-completed-calls-to-attributed-usage",
+                "reservation_policy": "settle-completed-calls-to-billable-usage-bound",
                 "entries": [dict(entry) for entry in self.entries],
             }
 
@@ -1077,6 +1135,27 @@ def parse_gateway_price(item: Mapping[str, Any]) -> tuple[float, float] | None:
         if prompt is not None and completion is not None and (prompt or completion):
             return prompt * 1_000_000, completion * 1_000_000
     return None
+
+
+def gateway_routed_roles(routes: Mapping[str, Mapping[str, Any]], gateway_url: str | None) -> set[str]:
+    """Roles whose bound route executes on the Understudy gateway.
+
+    Gateway-published prices apply only to these; a bridge route to another
+    provider keeps its flag or global price. The route id alone is not enough,
+    since a bridge route may claim it with any base URL: the bound credential-free
+    base URL must also be the gateway's.
+    """
+    if not gateway_url:
+        return set()
+    try:
+        gateway_base_sha256 = text_sha256(credential_free_api_base(gateway_url, append_v1=True)[0])
+    except ValueError:
+        return set()
+    return {
+        role
+        for role, route in routes.items()
+        if route.get("route_id") == "understudy-gateway" and route.get("base_url_sha256") == gateway_base_sha256
+    }
 
 
 def fetch_gateway_prices(
@@ -3067,13 +3146,9 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
     reflection_route, reflection_api_key, reflection_api_base = resolve_lm_route(
         "reflection", args.reflection_model, bridge_config, gateway_url,
     )
-    # Gateway-published prices apply only to roles that execute on the gateway;
-    # a bridge route to another provider keeps its flag or global price.
-    gateway_roles = {
-        role
-        for role, route in (("student", student_route), ("reflection", reflection_route))
-        if route["route_id"] == "understudy-gateway"
-    }
+    gateway_roles = gateway_routed_roles(
+        {"student": student_route, "reflection": reflection_route}, gateway_url,
+    )
     if args.prices_from_gateway == "off":
         ledger.set_gateway_prices({}, {"status": "off"}, set())
     elif not gateway_roles:

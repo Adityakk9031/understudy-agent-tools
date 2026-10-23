@@ -90,7 +90,7 @@ Spend controls, independent of the search:
 | Prices | `--input-usd-per-million`, `--output-usd-per-million` | The global fallback basis |
 | Per-model prices | `--model-price MODEL=IN,OUT` (repeatable) | Beats gateway prices and the global basis |
 | Reflection prices | `--reflection-input-usd-per-million`, `--reflection-output-usd-per-million` | For a pricier reflector |
-| Gateway prices | `--prices-from-gateway auto\|off\|require` | Reads `pricing` from the Understudy gateway's `/v1/models` for gateway-routed roles only. It publishes none today, so `auto` falls back to flags |
+| Gateway prices | `--prices-from-gateway auto\|off\|require` | Reads `pricing` from the Understudy gateway's `/v1/models` for gateway-routed roles only: the role's route is `understudy-gateway` and its bound base URL is `UNDERSTUDY_GATEWAY_URL`'s (a bridge route claiming the id with another base URL keeps flag prices). It publishes none today, so `auto` falls back to flags |
 | No cap | `--no-spend-ledger` | Records usage but blocks nothing; rejects `--budget-usd`; refused for program bridges |
 
 Price resolution per call: reflection flags, then `--model-price`, then gateway
@@ -296,8 +296,15 @@ understudy optimize-workload adapter run --adapter dspy-gepa --execute \
 
 `--max-metric-calls` is per round. The ledger cap covers the whole invocation.
 Each call reserves its worst case (input bytes plus its full output cap) before
-it is sent; once its usage comes back, the reservation settles to the call's
-attributed cost. Calls still in flight, and calls whose usage is missing or
+it is sent; once its usage comes back, the reservation settles to a billable
+bound (`settled_upper_bound_usd` per entry), capped at the reservation. DSPy's
+usage counters are provider-verbatim, so the bound is conservative: output is the
+larger of `output_tokens` and `total_tokens - input_tokens` (Gemini and xAI leave
+reasoning out of `output_tokens`), a separately reported `reasoning_tokens` is
+added when the total says nothing more, and reported cache writes are added to
+the input (Anthropic leaves them out of `input_tokens`). The attributed cost
+prices the reported counters and never exceeds the bound; for plain usage the
+two are equal. Calls still in flight, and calls whose usage is missing or
 ambiguous, keep their full reservation. Size `--budget-usd` at the expected
 spend plus `--num-threads` worst-case calls of headroom. Before settling, a
 Facility Support run (4,096-token student cap, 32 threads) was blocked at $5.91

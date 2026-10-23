@@ -329,14 +329,15 @@ describe("dspy-gepa holdout evaluation and match mode", () => {
       assert.equal(readCandidate(repo).instructions_changed, true);
     }));
 
-  it("settles each completed call's reservation to its attributed cost", { skip: !pythonAvailable }, () =>
+  it("settles each completed call's reservation to its attributed cost when usage reports nothing extra", { skip: !pythonAvailable }, () =>
     withRepo(({ repo }) => {
       const samples = writeSamples(repo, "holdout-samples.json", holdoutRows());
       const { result, payload } = runDspyGepa(repo, samples, ["--evaluate-holdout"]);
       assert.equal(result.status, 0, result.stderr);
       const evidence = payload().spend_evidence;
       assert.equal(evidence.reservations_are_cumulative, false);
-      assert.equal(evidence.reservation_policy, "settle-completed-calls-to-attributed-usage");
+      assert.equal(evidence.reservation_policy, "settle-completed-calls-to-billable-usage-bound");
+      for (const entry of evidence.entries) assert.equal(entry.settled_upper_bound_usd, entry.attributed_cost_usd);
       assert.ok(evidence.calls_completed > 2);
       assert.ok(Math.abs(evidence.reserved_upper_bound_usd - evidence.attributed_cost_usd) < 1e-12);
       const reservedTotal = evidence.entries.reduce((sum, entry) => sum + entry.reserved_upper_bound_usd, 0);
@@ -583,6 +584,158 @@ print(json.dumps({
         assert.notEqual(result.status, 0, extra.join(" "));
         assert.match(result.stderr, pattern, extra.join(" "));
       }
+    }));
+});
+
+describe("dspy-gepa spend ledger settlement", () => {
+  it("keeps the reservation for tokens billed outside output_tokens and cache writes outside input_tokens", { skip: !pythonAvailable }, () =>
+    withRepo(({ repo, samplesPath }) => {
+      const { runtime } = runDspyGepa(repo, samplesPath);
+      const seen = runtimeScript(runtime, `
+from types import SimpleNamespace as NS
+def usage(**fields):
+    # lm15 Usage: every counter present, None when the provider did not report it.
+    base = {"input_tokens": None, "output_tokens": None, "total_tokens": None, "cache_read_tokens": None,
+            "cache_write_tokens": None, "reasoning_tokens": None}
+    return NS(**{**base, **fields})
+def settle(reported, ceiling=(10000, 1000)):
+    ledger = rt.SpendLedger(1.0, 1.0, 2.0)
+    call = ledger.reserve(*ceiling, {"role": "student", "requested_model": "m"})
+    try:
+        ledger.complete(call, NS(usage=reported))
+    except rt.SpendEvidenceError as error:
+        return {"error": str(error), "failure": str(ledger.failure)}
+    entry = ledger.entries[0]
+    return {
+        "attributed": entry["attributed_cost_usd"],
+        "settled": entry["settled_upper_bound_usd"],
+        "reserved": entry["reserved_upper_bound_usd"],
+        "billable": [entry["billable_input_tokens"], entry["billable_output_tokens"]],
+        "ledger_reserved": ledger.reserved_upper_bound_usd,
+        "ledger_attributed": ledger.attributed_cost_usd,
+    }
+print(json.dumps({
+    "openai_plain": settle({"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}),
+    "lm15_plain": settle(usage(input_tokens=100, output_tokens=50, total_tokens=150)),
+    # Gemini and xAI: output excludes reasoning, the total includes it.
+    "reasoning_in_total": settle(usage(input_tokens=100, output_tokens=50, total_tokens=400, reasoning_tokens=250)),
+    "reasoning_no_total": settle({"prompt_tokens": 100, "completion_tokens": 50, "completion_tokens_details": {"reasoning_tokens": 200}}),
+    # lm15 fills an unreported total as input + output, so it says nothing more.
+    "reasoning_autofilled_total": settle(usage(input_tokens=100, output_tokens=50, total_tokens=150, reasoning_tokens=200)),
+    # Anthropic: input excludes cache writes.
+    "cache_write": settle(usage(input_tokens=100, output_tokens=50, total_tokens=150, cache_write_tokens=300)),
+    "cache_write_nested": settle({"prompt_tokens": 100, "completion_tokens": 50, "prompt_tokens_details": {"cache_write_tokens": 300}}),
+    "total_exceeds_output_cap": settle(usage(input_tokens=10, output_tokens=50, total_tokens=400), (10000, 100)),
+    # Reasoning reported beside completion_tokens is not an overrun (OpenAI counts it
+    # inside completion_tokens), but the settled bound keeps it, capped at the reservation.
+    "reasoning_capped": settle({"prompt_tokens": 10, "completion_tokens": 50, "completion_tokens_details": {"reasoning_tokens": 200}}, (20, 100)),
+}))
+`);
+      const price = (input, output) => (input + 2 * output) / 1e6;
+      const near = (actual, expected, label) => assert.ok(Math.abs(actual - expected) < 1e-15, `${label}: ${actual} != ${expected}`);
+      for (const name of ["openai_plain", "lm15_plain"]) {
+        near(seen[name].settled, price(100, 50), name);
+        near(seen[name].attributed, price(100, 50), name);
+        near(seen[name].ledger_reserved, seen[name].ledger_attributed, name);
+      }
+      const keeps = {
+        reasoning_in_total: [100, 300],
+        reasoning_no_total: [100, 250],
+        reasoning_autofilled_total: [100, 250],
+        cache_write: [400, 50],
+        cache_write_nested: [400, 50],
+      };
+      for (const [name, [input, output]] of Object.entries(keeps)) {
+        assert.deepEqual(seen[name].billable, [input, output], name);
+        near(seen[name].settled, price(input, output), name);
+        near(seen[name].ledger_reserved, price(input, output), name);
+        // Attribution still prices the reported counters, and never exceeds the bound.
+        near(seen[name].attributed, price(100, 50), name);
+        assert.ok(seen[name].attributed < seen[name].settled, name);
+      }
+      assert.deepEqual(seen.total_exceeds_output_cap, {
+        error: "provider-usage-exceeds-reservation",
+        failure: "provider-usage-exceeds-reservation",
+      });
+      near(seen.reasoning_capped.settled, seen.reasoning_capped.reserved, "reasoning_capped");
+      near(seen.reasoning_capped.ledger_reserved, price(20, 100), "reasoning_capped");
+      near(seen.reasoning_capped.attributed, price(10, 50), "reasoning_capped");
+    }));
+
+  it("latches a refused reservation before releasing the lock, so a racing call cannot slip through", { skip: !pythonAvailable }, () =>
+    withRepo(({ repo, samplesPath }) => {
+      const { runtime } = runDspyGepa(repo, samplesPath);
+      const seen = runtimeScript(runtime, `
+import threading
+class HandoffLock:
+    """Runs a second reservation in the gap right after the first one releases the lock."""
+    def __init__(self):
+        self.inner = threading.Lock()
+        self.after_release = None
+    def __enter__(self):
+        self.inner.acquire()
+        return self
+    def __exit__(self, *exc):
+        self.inner.release()
+        hook, self.after_release = self.after_release, None
+        if hook is not None:
+            hook()
+        return False
+identity = {"role": "student", "requested_model": "m"}
+out = {}
+for case in ("blocked", "no-price"):
+    ledger = rt.SpendLedger(1.0, 1.0, 2.0) if case == "blocked" else rt.SpendLedger(1.0, None, None)
+    lock = HandoffLock()
+    ledger._lock = lock
+    if case == "no-price":
+        # The racing call is priced; the first one has no price basis at all.
+        ledger.model_prices["priced"] = (1.0, 2.0)
+    racing = {"role": "student", "requested_model": "priced" if case == "no-price" else "m"}
+    seen = {}
+    def race():
+        try:
+            ledger.reserve(10, 10, racing)
+            seen["racing"] = "reserved"
+        except (rt.SpendBudgetExceeded, rt.SpendEvidenceError) as error:
+            seen["racing"] = type(error).__name__
+    lock.after_release = race
+    try:
+        ledger.reserve(10**9, 10**9, identity)
+    except (rt.SpendBudgetExceeded, rt.SpendEvidenceError) as error:
+        seen["first"] = type(error).__name__
+    seen["calls_attempted"] = ledger.calls_attempted
+    out[case] = seen
+print(json.dumps(out))
+`);
+      assert.deepEqual(seen.blocked, { first: "SpendBudgetExceeded", racing: "SpendBudgetExceeded", calls_attempted: 0 });
+      assert.deepEqual(seen["no-price"], { first: "SpendEvidenceError", racing: "SpendEvidenceError", calls_attempted: 0 });
+    }));
+
+  it("applies gateway prices only to routes whose bound base URL is the gateway's", { skip: !pythonAvailable }, () =>
+    withRepo(({ repo, samplesPath }) => {
+      const { runtime } = runDspyGepa(repo, samplesPath);
+      const seen = runtimeScript(runtime, `
+gateway = "http://gateway.test"
+claimed = {"inference_routes": {"student": {
+    "route_id": "understudy-gateway", "base_url": "https://cheaper.example/v1", "api_key_env": "FIXTURE_KEY",
+    "requested_model": "m", "executed_model": "openai/m",
+}}}
+default_route = rt.resolve_lm_route("student", "m", {}, gateway)[0]
+claimed_route = rt.resolve_lm_route("student", "m", claimed, gateway)[0]
+print(json.dumps({
+    "default": sorted(rt.gateway_routed_roles({"student": default_route}, gateway)),
+    "default_with_slash": sorted(rt.gateway_routed_roles({"student": default_route}, gateway + "/v1/")),
+    "claimed": sorted(rt.gateway_routed_roles({"student": claimed_route, "reflection": default_route}, gateway)),
+    "no_gateway": sorted(rt.gateway_routed_roles({"student": default_route}, None)),
+    "bad_gateway": sorted(rt.gateway_routed_roles({"student": default_route}, "ftp://gateway.test")),
+}))
+`, { ...baseEnv, UNDERSTUDY_API_KEY: "fixture-key", FIXTURE_KEY: "fixture-key" });
+      assert.deepEqual(seen.default, ["student"]);
+      assert.deepEqual(seen.default_with_slash, ["student"]);
+      // A bridge route may claim the gateway's route id, but not its base URL.
+      assert.deepEqual(seen.claimed, ["reflection"]);
+      assert.deepEqual(seen.no_gateway, []);
+      assert.deepEqual(seen.bad_gateway, []);
     }));
 });
 

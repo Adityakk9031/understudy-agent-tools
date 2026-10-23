@@ -211,10 +211,10 @@ uses semantic-ish versioning (minor = new skill or new capability, patch = fixes
   student `--max-tokens` default rises from 256 to 2048 and reflection gets its
   own `--reflection-max-tokens` (default 2048): a 256-token reflection cap
   truncated GEPA's JSON proposals and silently left the seed prompt unchanged.
-  The ledger now settles each completed call's reservation to its attributed
-  cost; only in-flight and usage-ambiguous calls hold their worst case. Holding
-  every call at its full output cap blocked a live run at $5.91 reserved
-  against $0.23 spent.
+  The ledger now settles each completed call's reservation to a conservative
+  billable bound; only in-flight and usage-ambiguous calls hold their worst
+  case. Holding every call at its full output cap blocked a live run at $5.91
+  reserved against $0.23 spent.
 - **`check-routing-health` now leads with the new reporting endpoints.**
   The skill's primary path is one org-wide grounding call to
   `/admin/v1/orgs/:org_id/reporting` (usage/cost series across all projects,
@@ -236,6 +236,19 @@ uses semantic-ish versioning (minor = new skill or new capability, patch = fixes
 
 ### Fixed
 
+- **`dspy-gepa` spend settles to what may have been billed.** A completed call
+  used to settle to the price of its reported input and output tokens, but
+  DSPy's usage counters are provider-verbatim: Gemini and xAI leave reasoning
+  out of `output_tokens` and Anthropic leaves cache writes out of
+  `input_tokens`. Settling now keeps the larger of output and `total_tokens`
+  minus input, adds separately reported reasoning when the total adds nothing,
+  and adds reported cache writes (attribute or nested dict usage), capped at
+  the reservation and recorded per entry as `settled_upper_bound_usd`; the
+  overrun check reads `total_tokens` too. The fail-closed latch and the refusal
+  that sets it now happen under the reservation lock, so a concurrent call can
+  no longer reserve in between. Gateway prices apply only to roles whose bound
+  base URL is the gateway's, not to any bridge route that names itself
+  `understudy-gateway`.
 - **Honest backend readiness for the same training plan.** Compiling a portable
   plan no longer claims a backend can run a recipe it has no executor for:
   `adapter_implemented` now comes from the local MLX and Tinker executor
