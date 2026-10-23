@@ -211,8 +211,10 @@ uses semantic-ish versioning (minor = new skill or new capability, patch = fixes
   student `--max-tokens` default rises from 256 to 2048 and reflection gets its
   own `--reflection-max-tokens` (default 2048): a 256-token reflection cap
   truncated GEPA's JSON proposals and silently left the seed prompt unchanged.
-  Because the ledger reserves each call's full output cap, default runs need a
-  larger `--budget-usd`.
+  The ledger now settles each completed call's reservation to its attributed
+  cost; only in-flight and usage-ambiguous calls hold their worst case. Holding
+  every call at its full output cap blocked a live run at $5.91 reserved
+  against $0.23 spent.
 - **`check-routing-health` now leads with the new reporting endpoints.**
   The skill's primary path is one org-wide grounding call to
   `/admin/v1/orgs/:org_id/reporting` (usage/cost series across all projects,

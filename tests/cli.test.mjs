@@ -2325,7 +2325,7 @@ class ChainOfThought(Predict):
       );
       assert.ok(
         payload.spend_evidence.attributed_cost_usd
-          < payload.spend_evidence.reserved_upper_bound_usd,
+          <= payload.spend_evidence.reserved_upper_bound_usd,
       );
 
       const candidatePath = join(repo, ".understudy", "optimize-workload", "candidate.json");

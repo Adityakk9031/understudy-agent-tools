@@ -295,10 +295,13 @@ understudy optimize-workload adapter run --adapter dspy-gepa --execute \
 ```
 
 `--max-metric-calls` is per round. The ledger cap covers the whole invocation.
-Size it at roughly 1.5 to 2 times the expected ledger reservation: the ledger
-reserves each call's full output cap (about $0.0012 per student call at a
-1,024-token cap with `gpt-4.1-nano` prices), so 900 metric calls reserved $1.3
-to $2.9 against actual spend of $0.10 to $0.33.
+Each call reserves its worst case (input bytes plus its full output cap) before
+it is sent; once its usage comes back, the reservation settles to the call's
+attributed cost. Calls still in flight, and calls whose usage is missing or
+ambiguous, keep their full reservation. Size `--budget-usd` at the expected
+spend plus `--num-threads` worst-case calls of headroom. Before settling, a
+Facility Support run (4,096-token student cap, 32 threads) was blocked at $5.91
+reserved against $0.23 spent.
 
 ## Experiments: what climbing bought
 

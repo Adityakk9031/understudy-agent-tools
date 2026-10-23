@@ -304,18 +304,43 @@ describe("dspy-gepa holdout evaluation and match mode", () => {
   it("keeps the frozen candidate when the budget stops mid holdout evaluation", { skip: !pythonAvailable }, () =>
     withRepo(({ repo }) => {
       const samples = writeSamples(repo, "holdout-samples.json", holdoutRows());
-      const probe = runDspyGepa(mkdtempSync(join(repo, "probe-")), samples);
-      const perCall = probe.payload().spend_evidence.entries[0].reserved_upper_bound_usd;
-      // Room for three reservations: baseline, reflection and one holdout call.
-      const budget = String(perCall * 3.5);
-      const { result, payload } = runDspyGepa(repo, samples, ["--evaluate-holdout"], {}, [
-        "--budget-usd", budget, "--input-usd-per-million", "1", "--output-usd-per-million", "2",
+      const prices = ["--input-usd-per-million", "1", "--output-usd-per-million", "2"];
+      const env = { STUB_OUTPUT_TOKENS: "1000" };
+      const probe = runDspyGepa(mkdtempSync(join(repo, "probe-")), samples, ["--evaluate-holdout"], env, [
+        "--budget-usd", "10", ...prices,
+      ]);
+      // Completed calls settle to their attributed cost, so a call is blocked when
+      // the cost so far plus its own reservation crosses the cap. Pick a cap that
+      // admits the two optimization calls and blocks the first holdout call.
+      const entries = probe.payload().spend_evidence.entries;
+      const spentBefore = (index) => entries.slice(0, index).reduce((sum, entry) => sum + entry.attributed_cost_usd, 0);
+      const holdoutStart = 2;
+      const budget = spentBefore(holdoutStart) + entries[holdoutStart].reserved_upper_bound_usd * 0.99;
+      for (let index = 0; index < holdoutStart; index += 1) {
+        assert.ok(spentBefore(index) + entries[index].reserved_upper_bound_usd <= budget);
+      }
+      const { result, payload } = runDspyGepa(repo, samples, ["--evaluate-holdout"], env, [
+        "--budget-usd", String(budget), ...prices,
       ]);
       assert.equal(result.status, 0, result.stderr);
       assert.equal(payload().status, "candidate-created");
       assert.equal(payload().holdout_evaluation.status, "incomplete-budget");
       assert.equal(payload().holdout_evaluation.baseline, null);
       assert.equal(readCandidate(repo).instructions_changed, true);
+    }));
+
+  it("settles each completed call's reservation to its attributed cost", { skip: !pythonAvailable }, () =>
+    withRepo(({ repo }) => {
+      const samples = writeSamples(repo, "holdout-samples.json", holdoutRows());
+      const { result, payload } = runDspyGepa(repo, samples, ["--evaluate-holdout"]);
+      assert.equal(result.status, 0, result.stderr);
+      const evidence = payload().spend_evidence;
+      assert.equal(evidence.reservations_are_cumulative, false);
+      assert.equal(evidence.reservation_policy, "settle-completed-calls-to-attributed-usage");
+      assert.ok(evidence.calls_completed > 2);
+      assert.ok(Math.abs(evidence.reserved_upper_bound_usd - evidence.attributed_cost_usd) < 1e-12);
+      const reservedTotal = evidence.entries.reduce((sum, entry) => sum + entry.reserved_upper_bound_usd, 0);
+      assert.ok(reservedTotal > evidence.reserved_upper_bound_usd * 10);
     }));
 
   it("rejects --evaluate-holdout before any provider call when there are no holdout rows", { skip: !pythonAvailable }, () =>

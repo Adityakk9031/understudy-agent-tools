@@ -140,7 +140,8 @@ class InstructionProposer:
             handle.write("called\\n")
         if os.environ.get("STUB_ZERO_USAGE"):
             return SimpleNamespace(usage=SimpleNamespace(input_tokens=0, output_tokens=0))
-        return SimpleNamespace(usage=SimpleNamespace(input_tokens=10, output_tokens=5))`);
+        output_tokens = int(os.environ.get("STUB_OUTPUT_TOKENS", "5"))
+        return SimpleNamespace(usage=SimpleNamespace(input_tokens=10, output_tokens=output_tokens))`);
   writeFileSync(join(dspyRoot, "__init__.py"), `
 import copy
 import json

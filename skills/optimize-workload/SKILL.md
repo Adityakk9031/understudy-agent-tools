@@ -125,7 +125,8 @@ validator kinds in [`reference.md`](reference.md):
    additionally requires separate student/reflection model names, an approved dollar cap, and explicit input
    and output token prices before it resolves the Understudy API key. It passes
    auth to the child process through environment only, disables client-side
-   retries, and reserves each request against one cumulative price-basis ledger before
+   retries, and reserves each request's worst case against one price-basis ledger
+   (settled to attributed cost once usage returns) before
    running train/dev rows. A program bridge may bind student and reflection to
    independent credential-free routes by naming credential environment
    variables; missing mappings use the Understudy Gateway. Receipt the

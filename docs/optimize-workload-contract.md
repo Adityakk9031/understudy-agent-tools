@@ -149,7 +149,8 @@ Required behavior:
   token-price basis before resolving auth. Pass auth only through the child
   environment, disable client-side retries, and reserve a conservative
   price-basis upper bound before every request. Stop before a reservation could cross the
-  cap; fail closed when usage is missing (including zero input and zero output
+  cap; settle a completed call's reservation to its attributed cost once its usage is
+  known (in-flight and usage-ambiguous calls keep their full reservation); fail closed when usage is missing (including zero input and zero output
   tokens) or exceeds the reservation, and refuse every later reservation in
   that run. Run
   train/dev rows only, exclude holdout rows, and write owner-only candidate,
@@ -229,7 +230,7 @@ auto|off|require`; bridge routes to other providers never take gateway prices),
 then the global basis. The resolved prices are part of the hash-bound config,
 and every ledger entry records its role, price source, and rates. A model with
 no price from any source stops the run before the first provider call. Both
-independent LM instances share the same cumulative ledger, reserve before
+independent LM instances share the same ledger, reserve before
 every request, disable retries, and fail closed on incomplete usage evidence.
 
 `--evaluate-holdout` is a post-freeze diagnostic, not a claim: after

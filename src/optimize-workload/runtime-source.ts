@@ -946,6 +946,12 @@ class SpendLedger:
                         float(entry["output_usd_per_million"]),
                     )
                     self.attributed_cost_usd += attributed
+                    # Usage is known and within the reservation, so release the unused
+                    # part. In-flight calls and calls with missing or ambiguous usage
+                    # keep their full worst-case reservation, so the total stays an
+                    # upper bound. Holding every completed call at its output cap
+                    # overstated spend about 26x on a 4,096-token student cap.
+                    self.reserved_upper_bound_usd -= float(entry["reserved_upper_bound_usd"]) - attributed
                 entry.update({
                     "status": "complete",
                     "input_tokens": input_tokens,
@@ -1019,7 +1025,8 @@ class SpendLedger:
                     else None
                 ),
                 "gateway_price_lookup": self.price_lookup,
-                "reservations_are_cumulative": True,
+                "reservations_are_cumulative": False,
+                "reservation_policy": "settle-completed-calls-to-attributed-usage",
                 "entries": [dict(entry) for entry in self.entries],
             }
 
