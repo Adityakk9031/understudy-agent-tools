@@ -417,8 +417,11 @@ understudy optimize-workload adapter run --repo . --adapter dspy-gepa \
   --num-threads 1 --execute
 ```
 
-The adapter creates an approval-gated `uv run --no-project` runtime with exact
-`dspy==3.3.0`, `gepa[dspy]==0.1.1`, and `cloudpickle==3.1.2` packages.
+The adapter creates an approval-gated `uv run --no-project --python 3.13`
+runtime with exact `dspy==3.4.1`, `gepa[dspy]==0.1.4`, and `cloudpickle==3.1.2`
+packages plus `litellm>=1.83,<2`. Climb controls, streaming progress, and the
+holdout check are described in
+[`docs/dspy-gepa-hill-climbing.md`](docs/dspy-gepa-hill-climbing.md).
 Cloudpickle preserves resumable DSPy signature state. That environment, resumable
 logs, and owner-only optimizer receipts are local runtime state. They are not
 package infrastructure and must not be committed.
