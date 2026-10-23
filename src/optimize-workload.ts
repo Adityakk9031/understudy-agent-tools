@@ -63,6 +63,9 @@ type ProofPacketArtifact = {
 const understandDir = ".understudy/capture-evidence";
 const optimizeDir = ".understudy/optimize-workload";
 const runtimeDir = join(optimizeDir, "uv-runtime");
+// dspy needs >=3.10 and gepa/litellm need <3.15. Pin the interpreter so a
+// no-project run does not depend on whichever Python uv or the shell defaults to.
+const optimizerPythonVersion = "3.13";
 const requiredArtifacts = ["harness.json", "environment.json", "metric.json", "splits.json", "baseline.json"] as const;
 
 type AdapterRunOptions = {
@@ -81,6 +84,7 @@ type AdapterRunOptions = {
   trainSplit?: string;
   devSplit?: string;
   maxTokens?: string;
+  reflectionMaxTokens?: string;
   temperature?: string;
   reasoningEffort?: string;
   reflectionTemperature?: string;
@@ -88,6 +92,24 @@ type AdapterRunOptions = {
   budgetUsd?: string;
   inputUsdPerMillion?: string;
   outputUsdPerMillion?: string;
+  reflectionInputUsdPerMillion?: string;
+  reflectionOutputUsdPerMillion?: string;
+  modelPrice?: string[];
+  pricesFromGateway?: string;
+  spendLedger?: boolean;
+  evaluateHoldout?: boolean;
+  matchMode?: string;
+  seedInstructions?: string;
+  rounds?: string;
+  minRoundGain?: string;
+  stopAfterStale?: string;
+  stopAtScore?: string;
+  maxMinutes?: string;
+  proposalsPerIteration?: string;
+  proposerSkill?: string[];
+  proposerNote?: string;
+  proposerMaxChars?: string;
+  progress?: boolean;
   scoreObjective?: string;
   reflectionMinibatchSize?: string;
   candidateSelectionStrategy?: string;
@@ -126,7 +148,7 @@ const adapterRegistry: Record<string, UvAdapterSpec> = {
     name: "dspy-gepa",
     schemaVersion: "understudy.dspy_gepa_adapter.v2",
     runtimeCommand: "dspy-gepa",
-    packages: ["dspy==3.3.0", "gepa[dspy]==0.1.1", "cloudpickle==3.1.2"],
+    packages: ["dspy==3.4.1", "gepa[dspy]==0.1.4", "cloudpickle==3.1.2", "litellm>=1.83,<2"],
     providerCalls: true,
     requiresAuth: () => true,
     buildArgs: (repo, options) => {
@@ -163,18 +185,7 @@ const adapterRegistry: Record<string, UvAdapterSpec> = {
       if (!options.reflectionModel) {
         throw new Error("--reflection-model is required for dspy-gepa");
       }
-      const budgetUsd = requiredPositiveNumber(options.budgetUsd, "--budget-usd");
-      const inputUsdPerMillion = requiredNonNegativeNumber(
-        options.inputUsdPerMillion,
-        "--input-usd-per-million",
-      );
-      const outputUsdPerMillion = requiredNonNegativeNumber(
-        options.outputUsdPerMillion,
-        "--output-usd-per-million",
-      );
-      if (inputUsdPerMillion === 0 && outputUsdPerMillion === 0) {
-        throw new Error("dspy-gepa requires a non-zero input or output price basis");
-      }
+      const spendArgs = spendLedgerArgs(options);
       const temperature = requiredNonNegativeNumber(options.temperature ?? "0.1", "--temperature");
       const reflectionTemperature = requiredNonNegativeNumber(
         options.reflectionTemperature ?? "0.1",
@@ -216,7 +227,9 @@ const adapterRegistry: Record<string, UvAdapterSpec> = {
         "--dev-split",
         options.devSplit ?? "dev",
         "--max-tokens",
-        String(positiveInteger(options.maxTokens ?? "256", "--max-tokens")),
+        String(positiveInteger(options.maxTokens ?? "2048", "--max-tokens")),
+        "--reflection-max-tokens",
+        String(positiveInteger(options.reflectionMaxTokens ?? "2048", "--reflection-max-tokens")),
         "--temperature",
         String(temperature),
         "--reasoning-effort",
@@ -225,12 +238,7 @@ const adapterRegistry: Record<string, UvAdapterSpec> = {
         String(reflectionTemperature),
         "--reflection-reasoning-effort",
         reflectionReasoningEffort,
-        "--budget-usd",
-        String(budgetUsd),
-        "--input-usd-per-million",
-        String(inputUsdPerMillion),
-        "--output-usd-per-million",
-        String(outputUsdPerMillion),
+        ...spendArgs,
         "--reflection-minibatch-size",
         String(positiveInteger(options.reflectionMinibatchSize ?? "1", "--reflection-minibatch-size")),
         "--candidate-selection-strategy",
@@ -249,6 +257,7 @@ const adapterRegistry: Record<string, UvAdapterSpec> = {
         resolve(options.logDir ?? join(repo, optimizeDir, "dspy-gepa", "gepa-log")),
         "--track-stats",
         "true",
+        ...searchArgs(options),
       ];
       if (options.samples) {
         args.push("--samples", resolve(options.samples));
@@ -421,7 +430,159 @@ function nonNegativeInteger(value: string, flag: string): number {
   return parsed;
 }
 
-const secretKeyPattern = /(?:^|[_-])(api[_-]?key|authorization|password|secret|token)(?:$|[_-])/i;
+const pricesFromGatewayModes = ["auto", "off", "require"] as const;
+const matchModes = ["exact", "case-insensitive"] as const;
+
+function priceKey(model: string): string {
+  return model.startsWith("openai/") ? model.slice("openai/".length) : model;
+}
+
+function parseModelPriceFlag(entry: string): { model: string; input: number; output: number } {
+  const separator = entry.indexOf("=");
+  const prices = separator < 0 ? [] : entry.slice(separator + 1).split(",");
+  const input = Number(prices[0]);
+  const output = Number(prices[1]);
+  if (
+    separator <= 0 ||
+    prices.length !== 2 ||
+    !Number.isFinite(input) ||
+    !Number.isFinite(output) ||
+    input < 0 ||
+    output < 0 ||
+    (input === 0 && output === 0)
+  ) {
+    throw new Error(`--model-price must look like MODEL=INPUT,OUTPUT with non-negative USD per million tokens, got: ${entry}`);
+  }
+  return { model: priceKey(entry.slice(0, separator).trim()), input, output };
+}
+
+// Reflection may run on a pricier model than the student, so it can carry its own
+// price basis. Both prices or neither; without them the model or global basis applies.
+function optionalReflectionPrices(options: AdapterRunOptions): { input: number; output: number } | undefined {
+  const { reflectionInputUsdPerMillion: rawInput, reflectionOutputUsdPerMillion: rawOutput } = options;
+  if (rawInput === undefined && rawOutput === undefined) return undefined;
+  if (rawInput === undefined || rawOutput === undefined) {
+    throw new Error(
+      "--reflection-input-usd-per-million and --reflection-output-usd-per-million must be supplied together",
+    );
+  }
+  const input = requiredNonNegativeNumber(rawInput, "--reflection-input-usd-per-million");
+  const output = requiredNonNegativeNumber(rawOutput, "--reflection-output-usd-per-million");
+  if (input === 0 && output === 0) {
+    throw new Error("dspy-gepa requires a non-zero reflection input or output price basis");
+  }
+  return { input, output };
+}
+
+// Builds the spend-ledger flags for dspy-gepa. The ledger enforces a hard cap by
+// default; --no-spend-ledger turns it into an observer that records usage only and
+// is refused for program bridges, whose budget allocation binds the cap.
+function spendLedgerArgs(options: AdapterRunOptions): string[] {
+  const mode = options.pricesFromGateway ?? "auto";
+  if (!(pricesFromGatewayModes as readonly string[]).includes(mode)) {
+    throw new Error(`--prices-from-gateway must be one of: ${pricesFromGatewayModes.join(", ")}`);
+  }
+  const modelPrices = (options.modelPrice ?? []).map(parseModelPriceFlag);
+  const reflectionPrices = optionalReflectionPrices(options);
+  const args: string[] = [
+    ...modelPrices.flatMap((price) => ["--model-price", `${price.model}=${price.input},${price.output}`]),
+    ...(reflectionPrices
+      ? [
+          "--reflection-input-usd-per-million",
+          String(reflectionPrices.input),
+          "--reflection-output-usd-per-million",
+          String(reflectionPrices.output),
+        ]
+      : []),
+    "--prices-from-gateway",
+    mode,
+  ];
+  const hasGlobalPrice = options.inputUsdPerMillion !== undefined || options.outputUsdPerMillion !== undefined;
+  const globalPriceArgs = (): string[] => {
+    const input = requiredNonNegativeNumber(options.inputUsdPerMillion, "--input-usd-per-million");
+    const output = requiredNonNegativeNumber(options.outputUsdPerMillion, "--output-usd-per-million");
+    if (input === 0 && output === 0) {
+      throw new Error("dspy-gepa requires a non-zero input or output price basis");
+    }
+    return ["--input-usd-per-million", String(input), "--output-usd-per-million", String(output)];
+  };
+
+  if (options.spendLedger === false) {
+    if (options.programBridge) {
+      throw new Error("--no-spend-ledger is not supported with --program-bridge");
+    }
+    if (options.budgetUsd !== undefined) {
+      throw new Error("--budget-usd cannot be combined with --no-spend-ledger: no spend cap is enforced without the ledger");
+    }
+    return [...args, ...(hasGlobalPrice ? globalPriceArgs() : []), "--no-spend-ledger"];
+  }
+
+  const budgetUsd = requiredPositiveNumber(options.budgetUsd, "--budget-usd");
+  if (hasGlobalPrice) {
+    return [...args, "--budget-usd", String(budgetUsd), ...globalPriceArgs()];
+  }
+  const covered = new Set(modelPrices.map((price) => price.model));
+  const studentCovered = covered.has(priceKey(options.model ?? ""));
+  const reflectionCovered =
+    reflectionPrices !== undefined || covered.has(priceKey(options.reflectionModel ?? ""));
+  if (mode !== "require" && !(studentCovered && reflectionCovered)) {
+    throw new Error(
+      "--input-usd-per-million is required for provider-backed dspy-gepa unless every model has a --model-price / reflection price or --prices-from-gateway require is set",
+    );
+  }
+  return [...args, "--budget-usd", String(budgetUsd)];
+}
+
+// Climb and search flags for dspy-gepa: warm start, rounds, stoppers, multi-proposal
+// search, the instruction proposer, and the opt-in holdout evaluation. The runtime
+// re-validates every value before any provider call.
+function searchArgs(options: AdapterRunOptions): string[] {
+  if (options.matchMode !== undefined && !(matchModes as readonly string[]).includes(options.matchMode)) {
+    throw new Error(`--match-mode must be one of: ${matchModes.join(", ")}`);
+  }
+  if (options.programBridge) {
+    // A bridge owns its seed program, metric and holdout set.
+    const builtInOnly: Array<[string, boolean]> = [
+      ["--seed-instructions", Boolean(options.seedInstructions)],
+      ["--evaluate-holdout", options.evaluateHoldout === true],
+      ["--match-mode", options.matchMode !== undefined],
+    ];
+    for (const [flag, used] of builtInOnly) {
+      if (used) throw new Error(`${flag} is not supported with --program-bridge`);
+    }
+  }
+  const counted: Array<[string, string | undefined]> = [
+    ["--rounds", options.rounds],
+    ["--stop-after-stale", options.stopAfterStale],
+    ["--proposals-per-iteration", options.proposalsPerIteration],
+    ["--proposer-max-chars", options.proposerMaxChars],
+  ];
+  const args: string[] = [];
+  for (const [flag, value] of counted) {
+    if (value !== undefined) args.push(flag, String(positiveInteger(value, flag)));
+  }
+  for (const [flag, value] of [
+    ["--stop-at-score", options.stopAtScore],
+    ["--max-minutes", options.maxMinutes],
+  ] as const) {
+    if (value !== undefined) args.push(flag, String(requiredPositiveNumber(value, flag)));
+  }
+  if (options.minRoundGain !== undefined) {
+    args.push("--min-round-gain", String(requiredNonNegativeNumber(options.minRoundGain, "--min-round-gain")));
+  }
+  if (options.matchMode !== undefined) args.push("--match-mode", options.matchMode);
+  if (options.proposerNote !== undefined) args.push("--proposer-note", options.proposerNote);
+  if (options.seedInstructions) {
+    args.push("--seed-instructions", requireRegularFile(options.seedInstructions, "--seed-instructions"));
+  }
+  for (const skill of options.proposerSkill ?? []) {
+    args.push("--proposer-skill", resolve(skill));
+  }
+  if (options.evaluateHoldout === true) args.push("--evaluate-holdout");
+  return args;
+}
+
+const secretKeyPattern =/(?:^|[_-])(api[_-]?key|authorization|password|secret|token)(?:$|[_-])/i;
 const secretValuePattern = /^(?:bearer\s+|sk-[A-Za-z0-9]|-----BEGIN [A-Z ]*PRIVATE KEY-----)/i;
 const envNamePattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -658,6 +819,9 @@ export function runOptimizerAdapter(options: AdapterRunOptions): Record<string, 
     env.UNDERSTUDY_GATEWAY_URL = auth.gatewayUrl;
     env.UNDERSTUDY_AUTH_SOURCE = auth.source;
   }
+  // dspy-gepa streams progress lines to stderr when asked, or by default on a terminal.
+  const showProgress = adapter.name === "dspy-gepa" && (options.progress ?? Boolean(process.stderr.isTTY));
+  if (showProgress) args.push("--progress");
   const out = runUvPython(
     repo,
     runtimePath,
@@ -665,6 +829,7 @@ export function runOptimizerAdapter(options: AdapterRunOptions): Record<string, 
     adapter.packages,
     env,
     options.programProject ? resolve(options.programProject) : undefined,
+    showProgress,
   );
   freezeCandidateIntoActiveExperiment(repo, out);
   return out;
@@ -741,10 +906,12 @@ function runUvPython(
   packages: string[] = [],
   env: Record<string, string> = {},
   programProject?: string,
+  streamStderr = false,
 ): Record<string, unknown> {
+  // A locked workload project owns its interpreter through its own lock.
   const uvArgs = programProject
     ? ["run", "--project", programProject, "--locked"]
-    : ["run", "--no-project"];
+    : ["run", "--no-project", "--python", optimizerPythonVersion];
   if (!programProject) {
     for (const pkg of packages) {
       uvArgs.push("--with", pkg);
@@ -754,6 +921,8 @@ function runUvPython(
   const result = spawnSync("uv", uvArgs, {
     cwd: repo,
     encoding: "utf8",
+    // Inherit stderr so progress lines appear live; stdout stays captured for the final JSON.
+    ...(streamStderr ? { stdio: ["ignore", "pipe", "inherit"] as ["ignore", "pipe", "inherit"] } : {}),
     env: {
       ...process.env,
       ...env,

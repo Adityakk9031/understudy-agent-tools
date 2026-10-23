@@ -7,6 +7,15 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 
+import {
+  dspyLmStubSource,
+  writeDspyClientsEngineStub,
+  writeGepaPackageStubs,
+  writeMeteredDspyGepaStubs,
+  writePythonDistributionMetadata,
+  writeScoreWithFeedbackStub,
+} from "./helpers/dspy-gepa-stubs.mjs";
+
 const cli = ["node", resolve("dist/bin.js")];
 const uvAvailable = spawnSync("uv", ["--version"], { encoding: "utf8" }).status === 0;
 const pythonAvailable = spawnSync("python3", ["--version"], { encoding: "utf8" }).status === 0;
@@ -913,23 +922,20 @@ function withOptimizerFixtureRepo(fn) {
   }
 }
 
-function writePythonDistributionMetadata(root) {
-  for (const [name, version] of [["dspy", "3.3.0"], ["gepa", "0.1.1"], ["cloudpickle", "3.1.2"]]) {
-    const metadataDir = join(root, `${name}-${version}.dist-info`);
-    mkdirSync(metadataDir, { recursive: true });
-    writeFileSync(
-      join(metadataDir, "METADATA"),
-      `Metadata-Version: 2.1\nName: ${name}\nVersion: ${version}\n`,
-      "utf8",
-    );
-  }
-}
-
 function writeDspyGepaBridgeStubs(root) {
   const dspyRoot = join(root, "dspy");
-  const gepaRoot = join(dspyRoot, "teleprompt", "gepa");
-  mkdirSync(gepaRoot, { recursive: true });
+  mkdirSync(dspyRoot, { recursive: true });
   writePythonDistributionMetadata(root);
+  writeGepaPackageStubs(root);
+  writeScoreWithFeedbackStub(dspyRoot);
+  writeDspyClientsEngineStub(dspyRoot, `
+        return SimpleNamespace(
+            usage=SimpleNamespace(input_tokens=7, output_tokens=3),
+            model=f"provider-returned/{request.model}",
+            _hidden_params={
+                "additional_headers": {"x-model-id": f"effective/{request.model}"},
+            },
+        )`);
   const workloadMetadata = join(root, "fixture_workload-1.2.3.dist-info");
   mkdirSync(workloadMetadata);
   writeFileSync(
@@ -948,31 +954,20 @@ def configure(lm):
     global configured_lm
     configured_lm = lm
 
-class LM:
-    def __init__(self, model, max_tokens=None, num_retries=3, **kwargs):
-        self.model = model
-        self.kwargs = {"max_tokens": max_tokens}
-        self.num_retries = num_retries
-        self.api_base = kwargs.get("api_base")
-        with open(os.environ["MODEL_SENTINEL"], "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({
-                "model": model,
-                "api_base": self.api_base,
-                "temperature": kwargs.get("temperature"),
-                "reasoning_effort": kwargs.get("reasoning_effort"),
-                "num_retries": num_retries,
-            }) + "\\n")
-    def forward(self, prompt=None, messages=None, **kwargs):
-        if self.num_retries != 0:
-            raise AssertionError("retries were not disabled")
-        return SimpleNamespace(
-            usage={"prompt_tokens": 7, "completion_tokens": 3},
-            model=f"provider-returned/{self.model}",
-            _hidden_params={
-                "additional_headers": {"x-model-id": f"effective/{self.model}"},
-            },
-        )
-
+def _record_lm(lm):
+    # The credential and base URL live on the inner engine, never on dspy.LM.
+    inner = getattr(lm.engine, "_inner", None)
+    with open(os.environ["MODEL_SENTINEL"], "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "model": lm.model,
+            "api_base": getattr(inner, "api_base", None),
+            "metered_engine": type(lm.engine).__name__,
+            "max_tokens": lm.kwargs["max_tokens"],
+            "temperature": lm.kwargs["temperature"],
+            "reasoning_effort": lm.kwargs["reasoning_effort"],
+            "num_retries": lm.num_retries,
+        }) + "\\n")
+${dspyLmStubSource}
 class GEPA:
     def __init__(self, reflection_lm=None, **kwargs):
         self.reflection_lm = reflection_lm
@@ -980,6 +975,10 @@ class GEPA:
         serializable = dict(kwargs)
         serializable["metric_callable"] = callable(serializable.pop("metric"))
         serializable["reflection_model"] = reflection_lm.model
+        inner = dict(serializable.pop("gepa_kwargs"))
+        serializable["gepa_callbacks"] = [type(callback).__name__ for callback in inner.pop("callbacks")]
+        serializable["gepa_stoppers"] = [stopper.describe()[0] for stopper in inner.pop("stop_callbacks")]
+        serializable["gepa_kwargs"] = inner
         with open(os.environ["GEPA_KWARGS_SENTINEL"], "w", encoding="utf-8") as handle:
             json.dump(serializable, handle, sort_keys=True)
     def compile(self, student, trainset=None, valset=None):
@@ -989,14 +988,6 @@ class GEPA:
             raise AssertionError("metric did not return ScoreWithFeedback")
         self.reflection_lm.forward(prompt="reflect")
         return student
-`, "utf8");
-  writeFileSync(join(dspyRoot, "teleprompt", "__init__.py"), "", "utf8");
-  writeFileSync(join(gepaRoot, "__init__.py"), "", "utf8");
-  writeFileSync(join(gepaRoot, "gepa_utils.py"), `
-class ScoreWithFeedback:
-    def __init__(self, score, feedback):
-        self.score = score
-        self.feedback = feedback
 `, "utf8");
 }
 
@@ -2012,15 +2003,19 @@ printf '%s\n' '{"schema_version":"fixture.uv.v1","status":"fixture-ok"}'
       });
       assert.equal(result.status, 0, result.stderr);
       const uvArgs = readFileSync(uvArgsPath, "utf8").trim().split("\n");
-      assert.deepEqual(uvArgs.slice(0, 8), [
+      assert.deepEqual(uvArgs.slice(0, 12), [
         "run",
         "--no-project",
+        "--python",
+        "3.13",
         "--with",
-        "dspy==3.3.0",
+        "dspy==3.4.1",
         "--with",
-        "gepa[dspy]==0.1.1",
+        "gepa[dspy]==0.1.4",
         "--with",
         "cloudpickle==3.1.2",
+        "--with",
+        "litellm>=1.83,<2",
       ]);
       const flagValue = (flag) => uvArgs[uvArgs.indexOf(flag) + 1];
       assert.equal(flagValue("--model"), "student-deployment");
@@ -2032,6 +2027,10 @@ printf '%s\n' '{"schema_version":"fixture.uv.v1","status":"fixture-ok"}'
       assert.equal(flagValue("--num-threads"), "1");
       assert.equal(flagValue("--seed"), "42");
       assert.equal(flagValue("--track-stats"), "true");
+      assert.equal(flagValue("--max-tokens"), "2048");
+      assert.equal(flagValue("--reflection-max-tokens"), "2048");
+      assert.equal(flagValue("--prices-from-gateway"), "auto");
+      assert.equal(uvArgs.includes("--evaluate-holdout"), false);
 
       const bridgePath = join(repo, "locked-bridge.py");
       const bridgeConfigPath = join(repo, "locked-bridge-config.json");
@@ -2153,28 +2152,22 @@ printf '%s\n' '{"schema_version":"fixture.uv.v1","status":"fixture-ok"}'
       const runtime = join(repo, ".understudy", "optimize-workload", "uv-runtime", "optimizer_runtime.py");
       const stubDir = join(repo, "python-stubs");
       const sentinel = join(repo, "provider-was-called");
-      mkdirSync(stubDir, { recursive: true });
+      mkdirSync(join(stubDir, "dspy"), { recursive: true });
       writePythonDistributionMetadata(stubDir);
-      writeFileSync(join(stubDir, "dspy.py"), `
-import os
-
+      writeDspyClientsEngineStub(join(stubDir, "dspy"), `
+        with open(os.environ["PROVIDER_SENTINEL"], "w", encoding="utf-8") as handle:
+            handle.write("called")
+        raise AssertionError("provider boundary reached")`);
+      writeFileSync(join(stubDir, "dspy", "__init__.py"), `
 configured_lm = None
 
 def configure(lm):
     global configured_lm
     configured_lm = lm
 
-class LM:
-    def __init__(self, model, max_tokens=None, **kwargs):
-        self.model = model
-        self.kwargs = {"max_tokens": max_tokens}
-    def __call__(self, prompt=None, messages=None, **kwargs):
-        return self.forward(prompt=prompt, messages=messages, **kwargs)
-    def forward(self, prompt=None, messages=None, **kwargs):
-        with open(os.environ["PROVIDER_SENTINEL"], "w", encoding="utf-8") as handle:
-            handle.write("called")
-        raise AssertionError("provider boundary reached")
-
+def _record_lm(lm):
+    pass
+${dspyLmStubSource}
 class Signature:
     def __init__(self, value):
         self.value = value
@@ -2267,74 +2260,8 @@ class ChainOfThought(Predict):
       assert.equal(scaffold.status, 1);
       const runtime = join(repo, ".understudy", "optimize-workload", "uv-runtime", "optimizer_runtime.py");
       const stubRoot = join(repo, "metered-python-stubs");
-      const dspyRoot = join(stubRoot, "dspy");
-      const gepaRoot = join(dspyRoot, "teleprompt", "gepa");
       const sentinel = join(repo, "provider-call-count");
-      mkdirSync(gepaRoot, { recursive: true });
-      writePythonDistributionMetadata(stubRoot);
-      writeFileSync(join(dspyRoot, "__init__.py"), `
-import copy
-import os
-from types import SimpleNamespace
-
-configured_lm = None
-
-def configure(lm):
-    global configured_lm
-    configured_lm = lm
-
-class LM:
-    def __init__(self, model, max_tokens=None, num_retries=3, **kwargs):
-        self.model = model
-        self.kwargs = {"max_tokens": max_tokens}
-        self.num_retries = num_retries
-    def __call__(self, prompt=None, messages=None, **kwargs):
-        return self.forward(prompt=prompt, messages=messages, **kwargs)
-    def forward(self, prompt=None, messages=None, **kwargs):
-        if self.num_retries != 0:
-            raise AssertionError("retries were not disabled")
-        with open(os.environ["PROVIDER_SENTINEL"], "a", encoding="utf-8") as handle:
-            handle.write("called\\n")
-        return SimpleNamespace(usage={"prompt_tokens": 10, "completion_tokens": 5})
-
-class Signature:
-    def __init__(self, value):
-        self.value = value
-
-class Example:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-    def with_inputs(self, *keys):
-        return self
-
-class Predict:
-    def __init__(self, signature):
-        self.signature = signature
-    def __call__(self, **kwargs):
-        configured_lm.forward(prompt=str(kwargs))
-        return SimpleNamespace(answer="a1")
-    def dump_state(self, json_mode=False):
-        return {"signature": "question -> answer"}
-
-class ChainOfThought(Predict):
-    pass
-
-class GEPA:
-    def __init__(self, reflection_lm=None, **kwargs):
-        self.reflection_lm = reflection_lm
-    def compile(self, student, trainset=None, valset=None):
-        copied = copy.deepcopy(self.reflection_lm)
-        copied.forward(prompt="reflection")
-        return student
-`, "utf8");
-      writeFileSync(join(dspyRoot, "teleprompt", "__init__.py"), "", "utf8");
-      writeFileSync(join(gepaRoot, "__init__.py"), "", "utf8");
-      writeFileSync(join(gepaRoot, "gepa_utils.py"), `
-class ScoreWithFeedback:
-    def __init__(self, score, feedback):
-        self.score = score
-        self.feedback = feedback
-`, "utf8");
+      writeMeteredDspyGepaStubs(stubRoot);
       const result = spawnSync("python3", [
         runtime,
         "dspy-gepa",
@@ -2366,6 +2293,7 @@ class ScoreWithFeedback:
           ...baseEnv,
           PYTHONPATH: stubRoot,
           PROVIDER_SENTINEL: sentinel,
+          GEPA_KWARGS_PATH: join(repo, "gepa-kwargs.json"),
           UNDERSTUDY_API_KEY: "fixture-key",
           UNDERSTUDY_GATEWAY_URL: "http://127.0.0.1:9",
           UNDERSTUDY_AUTH_SOURCE: "fixture",
@@ -2570,6 +2498,8 @@ class ScoreWithFeedback:
       ]);
       assert.deepEqual(models.map((item) => item.num_retries), [0, 0]);
       assert.deepEqual(models.map((item) => item.reasoning_effort), [null, null]);
+      assert.deepEqual(models.map((item) => item.metered_engine), ["MeteredEngine", "MeteredEngine"]);
+      assert.deepEqual(models.map((item) => item.max_tokens), [128, 2048]);
       const gepaKwargs = JSON.parse(readFileSync(kwargsSentinel, "utf8"));
       assert.equal(gepaKwargs.max_metric_calls, 7);
       assert.equal(gepaKwargs.reflection_minibatch_size, 2);
@@ -2582,6 +2512,8 @@ class ScoreWithFeedback:
       assert.equal(gepaKwargs.track_stats, true);
       assert.equal(gepaKwargs.track_best_outputs, true);
       assert.deepEqual(gepaKwargs.gepa_kwargs, { use_cloudpickle: true });
+      assert.deepEqual(gepaKwargs.gepa_callbacks, ["GepaProgress"]);
+      assert.deepEqual(gepaKwargs.gepa_stoppers, ["FileStopper"]);
       assert.equal(gepaKwargs.log_dir, realpathSync(logDir));
       assert.equal(
         gepaKwargs.reflection_model,
@@ -2590,8 +2522,9 @@ class ScoreWithFeedback:
 
       const runDir = join(repo, ".understudy", "optimize-workload", "dspy-gepa");
       const packageState = JSON.parse(readFileSync(join(runDir, "package-state.json"), "utf8"));
-      assert.deepEqual(packageState.requested, ["dspy==3.3.0", "gepa[dspy]==0.1.1", "cloudpickle==3.1.2"]);
-      assert.deepEqual(packageState.actual, { dspy: "3.3.0", gepa: "0.1.1", cloudpickle: "3.1.2" });
+      assert.deepEqual(packageState.requested, ["dspy==3.4.1", "gepa[dspy]==0.1.4", "cloudpickle==3.1.2"]);
+      assert.deepEqual(packageState.actual, { dspy: "3.4.1", gepa: "0.1.4", cloudpickle: "3.1.2" });
+      assert.deepEqual(packageState.bounded.litellm, { requested: "litellm>=1.83,<2", actual: "1.106.2" });
       assert.deepEqual(packageState.workload_actual, { "fixture-workload": "1.2.3" });
       assert.equal(packageState.program_project.locked, true);
       assert.equal(packageState.program_project.uv_lock_sha256.length, 64);

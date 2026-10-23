@@ -2,6 +2,7 @@ export const optimizerRuntimeSource = String.raw`#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -11,7 +12,11 @@ import os
 import platform
 import re
 import socket
+import sys
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 from pathlib import Path
 from collections.abc import Callable, Mapping
@@ -19,12 +24,19 @@ from types import MappingProxyType
 from typing import Any
 
 
-DSPY_PACKAGE_SPEC = "dspy==3.3.0"
-DSPY_VERSION = "3.3.0"
-GEPA_PACKAGE_SPEC = "gepa[dspy]==0.1.1"
-GEPA_VERSION = "0.1.1"
+# dspy 3.4.1 hard-pins gepa==0.1.4. dspy 3.5 removes the legacy LM interfaces;
+# the spend ledger meters at the engine seam that replaces them.
+DSPY_PACKAGE_SPEC = "dspy==3.4.1"
+DSPY_VERSION = "3.4.1"
+GEPA_PACKAGE_SPEC = "gepa[dspy]==0.1.4"
+GEPA_VERSION = "0.1.4"
 CLOUDPICKLE_PACKAGE_SPEC = "cloudpickle==3.1.2"
 CLOUDPICKLE_VERSION = "3.1.2"
+# litellm is bounded, not pinned: 1.83 is the security floor in the gepa 0.1.2
+# release notes and 2.x is an untested major.
+LITELLM_PACKAGE_SPEC = "litellm>=1.83,<2"
+LITELLM_MIN_VERSION = (1, 83)
+LITELLM_MAX_MAJOR_EXCLUSIVE = 2
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -128,12 +140,6 @@ def input_token_ceiling_from_bytes(message_bytes: int, message_count: int) -> in
     return message_bytes + 4096 + (64 * message_count)
 
 
-def serialized_message_shape(prompt: str | None, messages: list[dict[str, Any]] | None) -> tuple[int, int]:
-    normalized = messages or [{"role": "user", "content": prompt or ""}]
-    serialized = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), default=str)
-    return len(serialized.encode("utf-8")), len(normalized)
-
-
 def token_price(input_tokens: int, output_tokens: int, input_usd_per_million: float, output_usd_per_million: float) -> float:
     return (
         (input_tokens * input_usd_per_million)
@@ -170,6 +176,185 @@ def write_owner_only_json(path: Path, payload: dict[str, Any]) -> None:
         raise
     os.replace(temporary, path)
     path.chmod(0o600)
+
+
+class RunEvents:
+    """Append-only owner-only JSONL progress stream, flushed as each event happens.
+
+    Events carry counts, scores, token usage and instruction text, never sample
+    inputs, route URLs or credentials. Each invocation appends under its own
+    run_id so a resumed or admission-then-compile pair keeps one history. A
+    failed write disables the stream instead of the run.
+    """
+
+    def __init__(self, path: Path | None, echo: bool = False) -> None:
+        self.path = path
+        self.echo = echo
+        self.run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{os.getpid()}"
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._started = time.monotonic()
+        self._handle: Any = None
+        if path is not None:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                os.chmod(path, 0o600)
+                self._handle = os.fdopen(descriptor, "a", encoding="utf-8")
+            except OSError:
+                self._handle = None
+
+    def emit(self, event: str, **fields: Any) -> None:
+        with self._lock:
+            self._seq += 1
+            record = {
+                "seq": self._seq,
+                "run_id": self.run_id,
+                "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "elapsed_s": round(time.monotonic() - self._started, 1),
+                "event": event,
+                **fields,
+            }
+            if self._handle is not None:
+                try:
+                    self._handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+                    self._handle.flush()
+                except (OSError, ValueError):
+                    self._handle = None
+            if self.echo:
+                line = self._format(record)
+                if line:
+                    print(line, file=sys.stderr, flush=True)
+
+    def ledger_event(self, payload: dict[str, Any]) -> None:
+        fields = dict(payload)
+        self.emit(str(fields.pop("event")), **fields)
+
+    @staticmethod
+    def _format(record: dict[str, Any]) -> str | None:
+        elapsed = int(record["elapsed_s"])
+        stamp = f"[{elapsed // 60:02d}:{elapsed % 60:02d}]"
+        name = record["event"]
+        hidden = ("seq", "run_id", "at", "elapsed_s", "event")
+        if name == "call-completed":
+            # Calls are frequent; echo the first few, then every 25th.
+            if record["call_id"] > 3 and record["call_id"] % 25:
+                return None
+            cost = record.get("attributed_cost_usd")
+            spend = "$" + f"{cost:.4f}" if isinstance(cost, (int, float)) else "unpriced"
+            cap = record.get("approved_budget_usd")
+            cap_text = " of $" + f"{cap:g}" if cap else ""
+            return (
+                f"{stamp} call {record['call_id']} {record['role']} {record.get('model')} "
+                f"in={record.get('input_tokens')} out={record.get('output_tokens')} | spend {spend}{cap_text}"
+            )
+        if name == "phase":
+            return f"{stamp} phase: {record['name']}"
+        if name.startswith("gepa-candidate") or name in ("gepa-finished", "gepa-error"):
+            detail = {key: value for key, value in record.items() if key not in hidden}
+            return f"{stamp} {name} {json.dumps(detail, sort_keys=True, default=str)[:200]}"
+        if name == "gepa-valset-evaluated":
+            best = " (new best)" if record.get("is_best_program") else ""
+            score = record.get("average_score")
+            score_text = f"{score:.3f}" if isinstance(score, (int, float)) else "n/a"
+            return f"{stamp} candidate {record.get('candidate_idx')} val score {score_text}{best}"
+        if name == "holdout-progress":
+            return f"{stamp} holdout {record['program']}: {record['done']}/{record['total']} rows"
+        if name in ("run-started", "data-loaded", "round-finished", "run-finished", "run-failed", "budget-blocked"):
+            detail = {key: value for key, value in record.items() if key not in hidden}
+            return f"{stamp} {name} {json.dumps(detail, sort_keys=True, default=str)[:240]}"
+        return None
+
+
+class GepaProgress:
+    """GEPA 0.1.4 callbacks (every method optional) that stream optimizer progress."""
+
+    def __init__(self, events: RunEvents, best_path: Path | None, round_index: int = 1) -> None:
+        self._events = events
+        self._best_path = best_path
+        self._round = round_index
+
+    def on_optimization_start(self, event: dict[str, Any]) -> None:
+        self._events.emit(
+            "gepa-started",
+            round=self._round,
+            trainset_size=event.get("trainset_size"),
+            valset_size=event.get("valset_size"),
+        )
+
+    def on_proposal_end(self, event: dict[str, Any]) -> None:
+        self._events.emit(
+            "gepa-proposal",
+            round=self._round,
+            iteration=event.get("iteration"),
+            new_instructions=event.get("new_instructions"),
+        )
+
+    def on_valset_evaluated(self, event: dict[str, Any]) -> None:
+        evaluated = event.get("num_examples_evaluated")
+        total = event.get("total_valset_size")
+        is_best = bool(event.get("is_best_program"))
+        self._events.emit(
+            "gepa-valset-evaluated",
+            round=self._round,
+            iteration=event.get("iteration"),
+            candidate_idx=event.get("candidate_idx"),
+            average_score=event.get("average_score"),
+            num_examples_evaluated=evaluated,
+            total_valset_size=total,
+            is_best_program=is_best,
+        )
+        # Only a best that cleared the whole dev split is worth restarting from.
+        if is_best and self._best_path is not None and evaluated == total:
+            write_owner_only_json(self._best_path, {
+                "schema_version": "understudy.dspy_gepa_best_so_far.v1",
+                "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "round": self._round,
+                "iteration": event.get("iteration"),
+                "candidate_idx": event.get("candidate_idx"),
+                "average_score": event.get("average_score"),
+                "split": "dev",
+                "instructions": event.get("candidate"),
+            })
+
+    def on_candidate_accepted(self, event: dict[str, Any]) -> None:
+        self._events.emit(
+            "gepa-candidate-accepted",
+            round=self._round,
+            iteration=event.get("iteration"),
+            new_candidate_idx=event.get("new_candidate_idx"),
+            new_score=event.get("new_score"),
+            parent_ids=list(event.get("parent_ids") or []),
+        )
+
+    def on_candidate_rejected(self, event: dict[str, Any]) -> None:
+        self._events.emit(
+            "gepa-candidate-rejected",
+            round=self._round,
+            iteration=event.get("iteration"),
+            old_score=event.get("old_score"),
+            new_score=event.get("new_score"),
+            reason=event.get("reason"),
+        )
+
+    def on_optimization_end(self, event: dict[str, Any]) -> None:
+        self._events.emit(
+            "gepa-finished",
+            round=self._round,
+            best_candidate_idx=event.get("best_candidate_idx"),
+            total_iterations=event.get("total_iterations"),
+            total_metric_calls=event.get("total_metric_calls"),
+        )
+
+    def on_error(self, event: dict[str, Any]) -> None:
+        error = event.get("exception")
+        self._events.emit(
+            "gepa-error",
+            round=self._round,
+            iteration=event.get("iteration"),
+            error=type(error).__name__ if error is not None else None,
+            will_continue=event.get("will_continue"),
+        )
 
 
 def canonical_json_bytes(payload: Any) -> bytes:
@@ -498,30 +683,87 @@ def validate_budget_allocation(bridge_config: Mapping[str, Any], optimizer_cap_u
     return parsed
 
 
+def normalize_price_key(model: str | None) -> str | None:
+    if model is None:
+        return None
+    return model[len("openai/"):] if model.startswith("openai/") else model
+
+
 class SpendLedger:
+    """Reserve worst-case spend before each call and record usage after it.
+
+    Prices resolve per call: the reflection flags for reflection calls, then a
+    --model-price for the requested model, then a price the Understudy gateway
+    publishes (only for roles routed through it), then the global basis. With
+    enforce=False the ledger only observes: it never blocks a call and does not
+    need a budget or prices; it still records token usage per call.
+    """
+
     def __init__(
         self,
-        budget_usd: float,
-        input_usd_per_million: float,
-        output_usd_per_million: float,
+        budget_usd: float | None,
+        input_usd_per_million: float | None,
+        output_usd_per_million: float | None,
+        reflection_input_usd_per_million: float | None = None,
+        reflection_output_usd_per_million: float | None = None,
+        model_prices: Mapping[str, tuple[float, float]] | None = None,
+        enforce: bool = True,
     ) -> None:
-        self.budget_usd = positive_float(budget_usd, "budget_usd")
-        self.input_usd_per_million = non_negative_float(
-            input_usd_per_million,
-            "input_usd_per_million",
-        )
-        self.output_usd_per_million = non_negative_float(
-            output_usd_per_million,
-            "output_usd_per_million",
-        )
-        if self.input_usd_per_million == 0 and self.output_usd_per_million == 0:
-            raise ValueError("at least one token price must be non-zero")
+        self.enforce = enforce
+        if enforce:
+            if budget_usd is None:
+                raise ValueError("budget_usd is required while the spend ledger is enforced")
+            self.budget_usd: float | None = positive_float(budget_usd, "budget_usd")
+        else:
+            if budget_usd is not None:
+                raise ValueError("budget_usd cannot be combined with an observe-only spend ledger")
+            self.budget_usd = None
+        if (input_usd_per_million is None) != (output_usd_per_million is None):
+            raise ValueError("input and output prices must be supplied together")
+        self.input_usd_per_million: float | None = None
+        self.output_usd_per_million: float | None = None
+        if input_usd_per_million is not None and output_usd_per_million is not None:
+            self.input_usd_per_million = non_negative_float(
+                input_usd_per_million,
+                "input_usd_per_million",
+            )
+            self.output_usd_per_million = non_negative_float(
+                output_usd_per_million,
+                "output_usd_per_million",
+            )
+            if self.input_usd_per_million == 0 and self.output_usd_per_million == 0:
+                raise ValueError("at least one token price must be non-zero")
+        # Reflection often runs on a pricier model than the student. When given,
+        # its own price pair applies to calls made with role="reflection".
+        if (reflection_input_usd_per_million is None) != (reflection_output_usd_per_million is None):
+            raise ValueError("reflection input and output prices must be supplied together")
+        self.reflection_prices: tuple[float, float] | None = None
+        if reflection_input_usd_per_million is not None and reflection_output_usd_per_million is not None:
+            reflection_input = non_negative_float(
+                reflection_input_usd_per_million,
+                "reflection_input_usd_per_million",
+            )
+            reflection_output = non_negative_float(
+                reflection_output_usd_per_million,
+                "reflection_output_usd_per_million",
+            )
+            if reflection_input == 0 and reflection_output == 0:
+                raise ValueError("at least one reflection token price must be non-zero")
+            self.reflection_prices = (reflection_input, reflection_output)
+        self.model_prices: dict[str, tuple[float, float]] = dict(model_prices or {})
+        self.gateway_prices: dict[str, tuple[float, float]] = {}
+        self.gateway_roles: frozenset[str] = frozenset()
+        self.price_lookup: dict[str, Any] | None = None
         self.reserved_upper_bound_usd = 0.0
         self.attributed_cost_usd = 0.0
         self.calls_attempted = 0
         self.calls_completed = 0
         self.usage_complete = True
         self.entries: list[dict[str, Any]] = []
+        # The first budget or usage failure, kept even if DSPy or GEPA swallows
+        # the exception it raised inside an engine call.
+        self.failure: SpendBudgetExceeded | SpendEvidenceError | None = None
+        self.observer: Callable[[dict[str, Any]], None] | None = None
         self._lock = threading.Lock()
 
     def __deepcopy__(self, memo: dict[int, Any]) -> SpendLedger:
@@ -529,13 +771,71 @@ class SpendLedger:
         # process-wide ledger or a copied optimizer could bypass the cap.
         return self
 
-    def projected_reservation(self, input_token_ceiling: int, output_token_ceiling: int) -> float:
-        return token_price(
-            input_token_ceiling,
-            output_token_ceiling,
-            self.input_usd_per_million,
-            self.output_usd_per_million,
-        )
+    def _notify(self, payload: dict[str, Any]) -> None:
+        # Progress logging must never break a run or the spend accounting.
+        observer = self.observer
+        if observer is None:
+            return
+        try:
+            observer(payload)
+        except Exception:
+            pass
+
+    def _call_event(self, name: str, entry: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "event": name,
+            "call_id": entry["call_id"],
+            "role": entry["role"],
+            "model": entry["model"],
+            "status": entry["status"],
+            "input_tokens": entry.get("input_tokens"),
+            "output_tokens": entry.get("output_tokens"),
+            "call_cost_usd": entry.get("attributed_cost_usd"),
+            "price_source": entry["price_source"],
+            "calls_attempted": self.calls_attempted,
+            "calls_completed": self.calls_completed,
+            "attributed_cost_usd": self.attributed_cost_usd,
+            "reserved_upper_bound_usd": self.reserved_upper_bound_usd,
+            "approved_budget_usd": self.budget_usd,
+        }
+
+    def _fail(self, error: SpendBudgetExceeded | SpendEvidenceError) -> None:
+        if self.failure is None:
+            self.failure = error
+
+    def set_gateway_prices(
+        self,
+        prices: Mapping[str, tuple[float, float]],
+        lookup: Mapping[str, Any],
+        roles: set[str] | frozenset[str],
+    ) -> None:
+        self.gateway_prices = dict(prices)
+        self.gateway_roles = frozenset(roles)
+        self.price_lookup = dict(lookup)
+
+    def prices_for(self, model: str | None, role: str = "student") -> tuple[float, float, str] | None:
+        key = normalize_price_key(model)
+        if role == "reflection" and self.reflection_prices is not None:
+            return (*self.reflection_prices, "reflection-flag")
+        if key is not None and key in self.model_prices:
+            return (*self.model_prices[key], "model-flag")
+        if key is not None and role in self.gateway_roles and key in self.gateway_prices:
+            return (*self.gateway_prices[key], "gateway")
+        if self.input_usd_per_million is not None and self.output_usd_per_million is not None:
+            return (self.input_usd_per_million, self.output_usd_per_million, "global")
+        return None
+
+    def projected_reservation(
+        self,
+        input_token_ceiling: int,
+        output_token_ceiling: int,
+        role: str = "student",
+        model: str | None = None,
+    ) -> float:
+        prices = self.prices_for(model, role)
+        if prices is None:
+            return 0.0
+        return token_price(input_token_ceiling, output_token_ceiling, prices[0], prices[1])
 
     def reserve(
         self,
@@ -543,87 +843,277 @@ class SpendLedger:
         output_token_ceiling: int,
         call_identity: Mapping[str, Any] | None = None,
     ) -> int:
-        projected = self.projected_reservation(input_token_ceiling, output_token_ceiling)
+        if self.enforce and self.failure is not None:
+            # Fail closed for the rest of the run: once a call was blocked or
+            # returned unusable usage, no later call may reach a provider, even
+            # if an evaluator swallowed the first error and kept going.
+            raise type(self.failure)(str(self.failure))
+        role = str((call_identity or {}).get("role") or "student")
+        model = (call_identity or {}).get("requested_model")
+        prices = self.prices_for(model, role)
+        if prices is None and self.enforce:
+            error = SpendEvidenceError("no-price-basis-for-model")
+            self._fail(error)
+            raise error
+        projected = (
+            token_price(input_token_ceiling, output_token_ceiling, prices[0], prices[1])
+            if prices is not None
+            else 0.0
+        )
+        blocked_event: dict[str, Any] | None = None
+        call_id = 0
+        # Check and reserve under one lock so concurrent calls cannot both pass the cap.
         with self._lock:
             next_total = self.reserved_upper_bound_usd + projected
-            if next_total > self.budget_usd + 1e-12:
-                raise SpendBudgetExceeded("next-call-reservation-exceeds-budget")
-            self.calls_attempted += 1
-            call_id = self.calls_attempted
-            self.reserved_upper_bound_usd = next_total
-            entry = {
-                "call_id": call_id,
-                "status": "reserved",
-                "input_token_ceiling": input_token_ceiling,
-                "output_token_ceiling": output_token_ceiling,
-                "reserved_upper_bound_usd": projected,
-            }
-            if call_identity is not None:
-                identity = dict(call_identity)
-                canonical_json_bytes(identity)
-                entry["configured_identity"] = identity
-            self.entries.append(entry)
-            return call_id
+            if self.enforce and next_total > float(self.budget_usd) + 1e-12:
+                blocked_event = {
+                    "event": "budget-blocked",
+                    "role": role,
+                    "model": normalize_price_key(model),
+                    "next_reservation_usd": projected,
+                    "reserved_upper_bound_usd": self.reserved_upper_bound_usd,
+                    "approved_budget_usd": self.budget_usd,
+                    "calls_attempted": self.calls_attempted,
+                }
+            else:
+                self.calls_attempted += 1
+                call_id = self.calls_attempted
+                self.reserved_upper_bound_usd = next_total
+                entry = {
+                    "call_id": call_id,
+                    "status": "reserved",
+                    "role": role,
+                    "model": normalize_price_key(model),
+                    "price_source": prices[2] if prices is not None else None,
+                    "input_usd_per_million": prices[0] if prices is not None else None,
+                    "output_usd_per_million": prices[1] if prices is not None else None,
+                    "input_token_ceiling": input_token_ceiling,
+                    "output_token_ceiling": output_token_ceiling,
+                    "reserved_upper_bound_usd": projected,
+                }
+                if call_identity is not None:
+                    identity = dict(call_identity)
+                    canonical_json_bytes(identity)
+                    entry["configured_identity"] = identity
+                self.entries.append(entry)
+        if blocked_event is not None:
+            error = SpendBudgetExceeded("next-call-reservation-exceeds-budget")
+            self._fail(error)
+            self._notify(blocked_event)
+            raise error
+        return call_id
 
     def mark_error(self, call_id: int) -> None:
         with self._lock:
             self.entries[call_id - 1]["status"] = "provider-error-billing-ambiguous"
             self.usage_complete = False
+            event = self._call_event("call-failed", self.entries[call_id - 1])
+        self._notify(event)
 
     def complete(self, call_id: int, response: Any) -> None:
         usage = response.get("usage") if isinstance(response, Mapping) else getattr(response, "usage", None)
         input_tokens = usage_token_count(usage, "prompt_tokens", "input_tokens")
         output_tokens = usage_token_count(usage, "completion_tokens", "output_tokens")
+        error: SpendEvidenceError | None = None
         with self._lock:
             entry = self.entries[call_id - 1]
-            if input_tokens is None or output_tokens is None:
+            # DSPy's canonical Response defaults absent provider usage to zero
+            # tokens. A real call always consumes tokens, so zero input and zero
+            # output means the usage is unknown, not that the call was free.
+            if (
+                input_tokens is None
+                or output_tokens is None
+                or (input_tokens == 0 and output_tokens == 0)
+            ):
                 entry["status"] = "usage-missing"
                 self.usage_complete = False
-                raise SpendEvidenceError("provider-usage-missing")
-            if (
+                if self.enforce:
+                    error = SpendEvidenceError("provider-usage-missing")
+            elif self.enforce and (
                 input_tokens > int(entry["input_token_ceiling"])
                 or output_tokens > int(entry["output_token_ceiling"])
             ):
                 entry["status"] = "usage-exceeds-reservation"
                 self.usage_complete = False
-                raise SpendEvidenceError("provider-usage-exceeds-reservation")
-            attributed = token_price(
-                input_tokens,
-                output_tokens,
-                self.input_usd_per_million,
-                self.output_usd_per_million,
-            )
-            entry.update({
-                "status": "complete",
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "attributed_cost_usd": attributed,
-                "response_identity": response_identity_receipt(response),
-            })
-            self.calls_completed += 1
-            self.attributed_cost_usd += attributed
+                error = SpendEvidenceError("provider-usage-exceeds-reservation")
+            else:
+                attributed = None
+                if entry["input_usd_per_million"] is not None and entry["output_usd_per_million"] is not None:
+                    attributed = token_price(
+                        input_tokens,
+                        output_tokens,
+                        float(entry["input_usd_per_million"]),
+                        float(entry["output_usd_per_million"]),
+                    )
+                    self.attributed_cost_usd += attributed
+                entry.update({
+                    "status": "complete",
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "attributed_cost_usd": attributed,
+                    "response_identity": response_identity_receipt(response),
+                })
+                self.calls_completed += 1
+            event = self._call_event("call-completed", entry)
+            if error is not None:
+                self._fail(error)
+        self._notify(event)
+        if error is not None:
+            raise error
+
+    def price_configuration(self) -> dict[str, Any]:
+        """The hash-bound price inputs; resolved gateway prices are included."""
+        return {
+            "spend_enforcement": "ledger" if self.enforce else "none",
+            "global": (
+                [self.input_usd_per_million, self.output_usd_per_million]
+                if self.input_usd_per_million is not None
+                else None
+            ),
+            "reflection": list(self.reflection_prices) if self.reflection_prices is not None else None,
+            "models": {model: list(pair) for model, pair in sorted(self.model_prices.items())},
+            "gateway": {model: list(pair) for model, pair in sorted(self.gateway_prices.items())},
+            "gateway_roles": sorted(self.gateway_roles),
+            "resolution_order": ["reflection-flag", "model-flag", "gateway", "global"],
+        }
 
     def evidence(self) -> dict[str, Any]:
         with self._lock:
+            def basis(pair: tuple[float, float] | None, source: str = "user-supplied") -> dict[str, Any] | None:
+                if pair is None:
+                    return None
+                return {
+                    "source": source,
+                    "input_usd_per_million": pair[0],
+                    "output_usd_per_million": pair[1],
+                    "scope": "token-price-attribution-not-provider-invoice",
+                }
+
+            default_pair = (
+                (self.input_usd_per_million, self.output_usd_per_million)
+                if self.input_usd_per_million is not None and self.output_usd_per_million is not None
+                else None
+            )
             return {
+                "spend_enforcement": "ledger" if self.enforce else "none",
                 "approved_budget_usd": self.budget_usd,
                 "reserved_upper_bound_usd": self.reserved_upper_bound_usd,
                 "attributed_cost_usd": self.attributed_cost_usd,
+                "unpriced_calls": sum(1 for entry in self.entries if entry["input_usd_per_million"] is None),
                 "calls_attempted": self.calls_attempted,
                 "calls_completed": self.calls_completed,
                 "usage_complete": self.usage_complete,
                 "client_num_retries": 0,
                 "provider_invoice_verified": False,
                 "budget_scope": "optimizer-student-and-reflection-lm-calls-only",
-                "price_basis": {
-                    "source": "user-supplied",
-                    "input_usd_per_million": self.input_usd_per_million,
-                    "output_usd_per_million": self.output_usd_per_million,
-                    "scope": "token-price-attribution-not-provider-invoice",
-                },
+                "price_basis": basis(default_pair),
+                "reflection_price_basis": basis(self.reflection_prices),
+                "model_price_basis": (
+                    {model: basis(pair) for model, pair in sorted(self.model_prices.items())}
+                    if self.model_prices
+                    else None
+                ),
+                "gateway_price_basis": (
+                    {model: basis(pair, "understudy-gateway") for model, pair in sorted(self.gateway_prices.items())}
+                    if self.gateway_prices
+                    else None
+                ),
+                "gateway_price_lookup": self.price_lookup,
                 "reservations_are_cumulative": True,
                 "entries": [dict(entry) for entry in self.entries],
             }
+
+
+def parse_model_prices(values: list[str] | None) -> dict[str, tuple[float, float]]:
+    """Parse repeated MODEL=INPUT,OUTPUT flags (USD per million tokens)."""
+    prices: dict[str, tuple[float, float]] = {}
+    for value in values or []:
+        model, separator, pair = value.partition("=")
+        parts = pair.split(",")
+        if not model.strip() or separator != "=" or len(parts) != 2:
+            raise ValueError("--model-price must look like MODEL=INPUT,OUTPUT")
+        input_price = non_negative_float(parts[0], "model price input")
+        output_price = non_negative_float(parts[1], "model price output")
+        if input_price == 0 and output_price == 0:
+            raise ValueError("--model-price needs a non-zero input or output price")
+        prices[str(normalize_price_key(model.strip()))] = (input_price, output_price)
+    return prices
+
+
+def parse_gateway_price(item: Mapping[str, Any]) -> tuple[float, float] | None:
+    """Read a price pair from one gateway model entry.
+
+    Accepted shapes (USD): pricing.{input,output}_usd_per_million, per-token
+    pricing.{prompt,completion}, or top-level {input,output}_usd_per_million.
+    """
+
+    def number(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) and parsed >= 0 else None
+
+    for source in (item.get("pricing"), item):
+        if not isinstance(source, Mapping):
+            continue
+        input_price = number(source.get("input_usd_per_million"))
+        output_price = number(source.get("output_usd_per_million"))
+        if input_price is not None and output_price is not None and (input_price or output_price):
+            return input_price, output_price
+    pricing = item.get("pricing")
+    if isinstance(pricing, Mapping):
+        prompt = number(pricing.get("prompt"))
+        completion = number(pricing.get("completion"))
+        if prompt is not None and completion is not None and (prompt or completion):
+            return prompt * 1_000_000, completion * 1_000_000
+    return None
+
+
+def fetch_gateway_prices(
+    gateway_url: str,
+    api_key: str,
+    models: set[str],
+    timeout: float = 10.0,
+) -> tuple[dict[str, tuple[float, float]], dict[str, Any]]:
+    """Read per-model prices from the gateway's model list, if it publishes any.
+
+    Never raises: an unreachable or price-less gateway yields no prices. The
+    request goes only to the configured Understudy gateway, without following
+    redirects, so the key cannot be forwarded to another host. It is a model
+    list read, not an inference call, and is never metered.
+    """
+    import urllib.request
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *redirect_args: Any, **redirect_kwargs: Any) -> None:
+            return None
+
+    try:
+        base_url, _ = credential_free_api_base(gateway_url, append_v1=True)
+        request = urllib.request.Request(
+            f"{base_url}/models",
+            headers={"authorization": f"Bearer {api_key}", "accept": "application/json"},
+        )
+        with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as error:
+        return {}, {"status": "unavailable", "reason": type(error).__name__}
+    items = payload.get("data") if isinstance(payload, Mapping) else payload
+    if not isinstance(items, list):
+        return {}, {"status": "unavailable", "reason": "unexpected-response-shape"}
+    prices: dict[str, tuple[float, float]] = {}
+    for item in items:
+        if not isinstance(item, Mapping) or not isinstance(item.get("id"), str):
+            continue
+        pair = parse_gateway_price(item)
+        key = normalize_price_key(item["id"])
+        if pair is not None and key in models:
+            prices[str(key)] = pair
+    status = "ok" if prices else "no-prices-published"
+    return prices, {"status": status, "models_listed": len(items), "models_priced": sorted(prices)}
 
 
 def split_train_dev(rows: list[dict[str, Any]], split_key: str, train_split: str, dev_split: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
@@ -642,7 +1132,23 @@ def split_train_dev(rows: list[dict[str, Any]], split_key: str, train_split: str
     return train, dev, holdout_count
 
 
-def exact_match_feedback(output_keys: list[str], gold: Any, pred: Any) -> Any:
+def holdout_rows_for(rows: list[dict[str, Any]], split_key: str) -> list[dict[str, Any]]:
+    if not any(split_key in row for row in rows):
+        return []
+    return [row for row in rows if str(row.get(split_key)).lower() == "holdout"]
+
+
+MATCH_MODES = ("exact", "case-insensitive")
+
+
+def normalize_label(value: Any, match_mode: str) -> str:
+    text = str(value).strip()
+    if match_mode == "case-insensitive":
+        return " ".join(text.split()).casefold()
+    return text
+
+
+def exact_match_feedback(output_keys: list[str], gold: Any, pred: Any, match_mode: str = "exact") -> Any:
     from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback
 
     matches = []
@@ -650,10 +1156,13 @@ def exact_match_feedback(output_keys: list[str], gold: Any, pred: Any) -> Any:
     for key in output_keys:
         expected = str(getattr(gold, key, "")).strip()
         actual = str(getattr(pred, key, "")).strip()
-        ok = actual == expected
+        ok = normalize_label(actual, match_mode) == normalize_label(expected, match_mode)
         matches.append(ok)
         if not ok:
-            gaps.append(f"{key}: expected {expected!r}, got {actual!r}")
+            # Say so when the only difference is letter case, so the reflector fixes the
+            # format directly instead of inventing decision rules to explain a casing miss.
+            hint = " (differs only in letter case)" if actual.casefold() == expected.casefold() else ""
+            gaps.append(f"{key}: expected {expected!r}, got {actual!r}{hint}")
     score = sum(1.0 for item in matches if item) / len(matches) if matches else 0.0
     feedback = "All output fields matched." if not gaps else "Output mismatches: " + "; ".join(gaps)
     return ScoreWithFeedback(score=score, feedback=feedback)
@@ -667,6 +1176,22 @@ def dspy_run_state_path(args: argparse.Namespace) -> Path:
     return dspy_run_dir(args) / "run-state.json"
 
 
+def dspy_events_path(args: argparse.Namespace) -> Path:
+    return dspy_run_dir(args) / "events.jsonl"
+
+
+def dspy_best_so_far_path(args: argparse.Namespace) -> Path:
+    return dspy_run_dir(args) / "best-so-far.json"
+
+
+def dspy_stop_file_path(args: argparse.Namespace) -> Path:
+    return dspy_run_dir(args) / "STOP"
+
+
+def dspy_holdout_evaluation_path(args: argparse.Namespace) -> Path:
+    return dspy_run_dir(args) / "holdout-evaluation.json"
+
+
 def dspy_artifacts(args: argparse.Namespace) -> dict[str, str]:
     repo = Path(args.repo)
     run_dir = dspy_run_dir(args)
@@ -677,6 +1202,9 @@ def dspy_artifacts(args: argparse.Namespace) -> dict[str, str]:
         "bundle_manifest_path": run_dir / "bundle-manifest.json",
         "admission_receipt_path": run_dir / "admission-receipt.json",
         "run_state_path": run_dir / "run-state.json",
+        "events_path": dspy_events_path(args),
+        "best_so_far_path": dspy_best_so_far_path(args),
+        "holdout_evaluation_path": dspy_holdout_evaluation_path(args),
     }
     return {
         name: artifact_path(repo, path)
@@ -691,11 +1219,13 @@ def write_dspy_run_state(
     status: str,
     reason: str | None,
     extra: Mapping[str, Any] | None = None,
+    phase: str | None = None,
 ) -> None:
     evidence = ledger.evidence()
     payload = {
         "schema_version": "understudy.dspy_gepa_run_state.v2",
         "status": status,
+        "phase": phase,
         "reason": reason,
         "adapter": "dspy-gepa",
         "model": args.model,
@@ -717,8 +1247,18 @@ def emit_dspy_failure(
     reason: str,
     exit_code: int,
 ) -> None:
-    write_dspy_run_state(args, ledger, status, reason)
+    write_dspy_run_state(args, ledger, status, reason, phase=getattr(args, "phase", None))
     evidence = ledger.evidence()
+    events = getattr(args, "events", None)
+    if events is not None:
+        events.emit(
+            "run-failed",
+            status=status,
+            reason=reason,
+            phase=getattr(args, "phase", None),
+            calls_completed=evidence["calls_completed"],
+            attributed_cost_usd=evidence["attributed_cost_usd"],
+        )
     emit({
         "schema_version": "understudy.dspy_gepa_adapter.v2",
         "status": status,
@@ -735,6 +1275,14 @@ def emit_dspy_failure(
     raise SystemExit(exit_code)
 
 
+def litellm_version_in_bounds(version: str) -> bool:
+    match = re.match(r"^(\d+)\.(\d+)", version)
+    if match is None:
+        return False
+    parsed = (int(match.group(1)), int(match.group(2)))
+    return LITELLM_MIN_VERSION <= parsed and parsed[0] < LITELLM_MAX_MAJOR_EXCLUSIVE
+
+
 def require_exact_optimizer_packages(
     workload_package_pins: Mapping[str, Any] | None = None,
     project_state: Mapping[str, Any] | None = None,
@@ -745,6 +1293,7 @@ def require_exact_optimizer_packages(
             "gepa": importlib.metadata.version("gepa"),
             "cloudpickle": importlib.metadata.version("cloudpickle"),
         }
+        litellm_version = importlib.metadata.version("litellm")
     except importlib.metadata.PackageNotFoundError as error:
         raise RuntimePackageVersionError("runtime-package-version-mismatch") from error
     if actual != {
@@ -752,6 +1301,8 @@ def require_exact_optimizer_packages(
         "gepa": GEPA_VERSION,
         "cloudpickle": CLOUDPICKLE_VERSION,
     }:
+        raise RuntimePackageVersionError("runtime-package-version-mismatch")
+    if not litellm_version_in_bounds(litellm_version):
         raise RuntimePackageVersionError("runtime-package-version-mismatch")
     workload_actual: dict[str, str] = {}
     for distribution, expected in (workload_package_pins or {}).items():
@@ -768,6 +1319,9 @@ def require_exact_optimizer_packages(
         "schema_version": "understudy.dspy_gepa_package_state.v1",
         "requested": [DSPY_PACKAGE_SPEC, GEPA_PACKAGE_SPEC, CLOUDPICKLE_PACKAGE_SPEC],
         "actual": actual,
+        "bounded": {
+            "litellm": {"requested": LITELLM_PACKAGE_SPEC, "actual": litellm_version},
+        },
         "workload_actual": workload_actual,
         "program_project": dict(project_state) if project_state else None,
         "python": platform.python_version(),
@@ -1471,7 +2025,486 @@ def write_canonical_bundle(
     return manifest
 
 
+def new_provider_engine(api_key: str, api_base: str) -> Any:
+    from dspy.clients.engines import LiteLLMEngine
+
+    return LiteLLMEngine(api_key=api_key, api_base=api_base)
+
+
+class MeteredEngine:
+    """Reserve spend before and record usage after every provider call.
+
+    DSPy 3.4 deprecates BaseLM.forward() overrides and 3.5 removes them; the
+    engine contract (complete(Request) -> Response) is the supported seam, and
+    every DSPy LM call path crosses it. The cap fails closed: a call without a
+    numeric output ceiling, or whose response lacks usage, raises. Copies made
+    by DSPy share this engine, so they also share the one ledger. There is no
+    async counterpart, so an async call fails instead of running unmetered.
+    """
+
+    def __init__(
+        self,
+        inner: Any,
+        spend_ledger: SpendLedger,
+        role: str,
+        route_receipt: Mapping[str, Any],
+    ) -> None:
+        self._inner = inner
+        self._spend_ledger = spend_ledger
+        self._role = role
+        self._route_receipt = dict(route_receipt)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> MeteredEngine:
+        return self
+
+    def _output_token_ceiling(self, request: Any) -> int:
+        config = getattr(request, "config", None)
+        extensions = getattr(config, "extensions", None) or {}
+        value = (
+            getattr(config, "max_tokens", None)
+            or extensions.get("max_tokens")
+            or extensions.get("max_completion_tokens")
+        )
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            if not self._spend_ledger.enforce:
+                return 0  # observe-only: no cap to size, so a missing ceiling is not an error
+            raise ValueError("LM call is missing a numeric output-token ceiling")
+        parsed = int(value)
+        if parsed <= 0 or parsed != value:
+            raise ValueError("LM output-token ceiling must be a positive integer")
+        return parsed
+
+    def complete(self, request: Any) -> Any:
+        # repr() of the canonical request covers messages, system text, tools
+        # and config, and over-counts bytes versus the wire payload, which keeps
+        # the input-side reservation an upper bound.
+        message_bytes = len(repr(request).encode("utf-8"))
+        message_count = len(getattr(request, "messages", None) or []) + 1
+        call_id = self._spend_ledger.reserve(
+            input_token_ceiling_from_bytes(message_bytes, message_count),
+            self._output_token_ceiling(request),
+            {
+                "role": self._role,
+                "route_id": self._route_receipt["route_id"],
+                "route_binding_sha256": self._route_receipt["route_binding_sha256"],
+                "requested_model": self._route_receipt["requested_model"],
+                "executed_model": self._route_receipt["executed_model"],
+                "dspy_model": self._route_receipt["dspy_model"],
+                "base_url_sha256": self._route_receipt["base_url_sha256"],
+                "base_host_sha256": self._route_receipt["base_host_sha256"],
+            },
+        )
+        try:
+            response = self._inner.complete(request)
+        except BaseException:
+            self._spend_ledger.mark_error(call_id)
+            raise
+        self._spend_ledger.complete(call_id, response)
+        return response
+
+    def stream(self, request: Any) -> Any:
+        raise RuntimeError("streaming is not metered by the spend ledger")
+
+    def close(self) -> None:
+        close = getattr(self._inner, "close", None)
+        if callable(close):
+            close()
+
+
+def spend_cause(error: BaseException) -> SpendBudgetExceeded | SpendEvidenceError | None:
+    """DSPy wraps exceptions raised inside an engine (LMUnexpectedError); find ours in the chain."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        if isinstance(current, (SpendBudgetExceeded, SpendEvidenceError)):
+            return current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def load_seed_instructions(path: Path) -> dict[str, str]:
+    """Read warm-start instructions from a previous run's artifact or a plain text file.
+
+    Accepts best-so-far.json ({"instructions": {...}}), candidate.json
+    ({"optimized_instructions": {...}}), a {predictor: text} object, or plain text
+    (applied to every predictor).
+    """
+    text = path.read_text(encoding="utf-8")
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return {"*": text.strip()} if text.strip() else {}
+    if isinstance(payload, dict):
+        for key in ("instructions", "optimized_instructions"):
+            if isinstance(payload.get(key), dict):
+                payload = payload[key]
+                break
+        if payload and all(isinstance(key, str) and isinstance(value, str) for key, value in payload.items()):
+            return dict(payload)
+    raise ValueError(f"{path.name} does not contain instructions to seed from")
+
+
+def apply_instructions(program: Any, instructions: Mapping[str, str]) -> None:
+    named = dict(program.named_predictors())
+    unknown = sorted(set(instructions) - set(named) - {"*"})
+    if unknown:
+        raise ValueError(f"seed instructions name unknown predictors {unknown}; this program has {sorted(named)}")
+    for name, predictor in named.items():
+        text = instructions.get(name) or instructions.get("*")
+        if not text:
+            continue
+        signature = predictor.signature
+        setter = getattr(signature, "with_instructions", None)
+        if callable(setter):
+            predictor.signature = setter(text)
+        else:
+            signature.instructions = text
+
+
+def require_positive_int(value: Any, label: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise ValueError(f"{label} must be at least 1")
+    return parsed
+
+
+def proposer_skill_path(value: str) -> Path:
+    path = Path(value).resolve()
+    if path.is_dir():
+        skill = path / "SKILL.md"
+        if not skill.is_file() or skill.is_symlink():
+            raise ValueError("--proposer-skill directory must contain a regular SKILL.md")
+        return path
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("--proposer-skill path does not exist or is not a regular file")
+    return path
+
+
+def optional_positive_float(value: Any, label: str) -> float | None:
+    if value is None:
+        return None
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError(f"{label} must be a positive number")
+    return parsed
+
+
+def validate_search_options(args: argparse.Namespace) -> None:
+    """Parse search settings in place and reject bad or bridge-incompatible ones before any call."""
+    args.rounds = require_positive_int(args.rounds, "--rounds")
+    args.proposals_per_iteration = require_positive_int(args.proposals_per_iteration, "--proposals-per-iteration")
+    if args.stop_after_stale is not None:
+        args.stop_after_stale = require_positive_int(args.stop_after_stale, "--stop-after-stale")
+    if args.proposer_max_chars is not None:
+        args.proposer_max_chars = require_positive_int(args.proposer_max_chars, "--proposer-max-chars")
+    args.stop_at_score = optional_positive_float(args.stop_at_score, "--stop-at-score")
+    args.max_minutes = optional_positive_float(args.max_minutes, "--max-minutes")
+    args.min_round_gain = float(args.min_round_gain)
+    if not math.isfinite(args.min_round_gain) or args.min_round_gain < 0:
+        raise ValueError("--min-round-gain must be a non-negative number")
+    if args.match_mode not in MATCH_MODES:
+        raise ValueError("--match-mode must be exact or case-insensitive")
+    for skill in args.proposer_skill or []:
+        proposer_skill_path(skill)
+    if args.seed_instructions:
+        seed = Path(args.seed_instructions)
+        if not seed.is_file() or seed.is_symlink():
+            raise ValueError("--seed-instructions file does not exist")
+    if args.program_bridge:
+        # A bridge owns its seed program, metric and holdout. These flags act on
+        # the built-in signature scaffold only.
+        for flag, used in (
+            ("--seed-instructions", bool(args.seed_instructions)),
+            ("--evaluate-holdout", bool(args.evaluate_holdout)),
+            ("--match-mode", args.match_mode != "exact"),
+            ("--no-spend-ledger", bool(args.no_spend_ledger)),
+        ):
+            if used:
+                raise ValueError(f"{flag} is not supported with --program-bridge")
+
+
+def search_settings(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
+    """Hash-bound climb and search settings; file inputs are bound by content hash."""
+    seed_path = Path(args.seed_instructions).resolve() if args.seed_instructions else None
+    skills = [proposer_skill_path(skill) for skill in args.proposer_skill or []]
+    return {
+        "rounds": int(args.rounds),
+        "min_round_gain": float(args.min_round_gain),
+        "proposals_per_iteration": int(args.proposals_per_iteration),
+        "stop_after_stale": int(args.stop_after_stale) if args.stop_after_stale is not None else None,
+        "stop_at_score": float(args.stop_at_score) if args.stop_at_score is not None else None,
+        "max_minutes": float(args.max_minutes) if args.max_minutes is not None else None,
+        "proposer_skills": [
+            {
+                "logical_path": logical_path(repo, skill),
+                "sha256": file_sha256(skill / "SKILL.md" if skill.is_dir() else skill),
+            }
+            for skill in skills
+        ],
+        "proposer_note": args.proposer_note,
+        "proposer_max_chars": int(args.proposer_max_chars) if args.proposer_max_chars is not None else None,
+        "seed_instructions": (
+            {"logical_path": logical_path(repo, seed_path), "sha256": file_sha256(seed_path)}
+            if seed_path is not None
+            else None
+        ),
+        "match_mode": args.match_mode,
+        "stop_file": artifact_path(repo, dspy_stop_file_path(args)),
+    }
+
+
+def build_gepa_search_kwargs(
+    args: argparse.Namespace,
+    events: RunEvents,
+    stop_file: Path,
+    best_path: Path,
+    round_index: int,
+) -> dict[str, Any]:
+    """dspy.GEPA keyword arguments for callbacks, stoppers and proposal strategy."""
+    from gepa.utils.stop_condition import (
+        FileStopper,
+        NoImprovementStopper,
+        ScoreThresholdStopper,
+        TimeoutStopCondition,
+    )
+
+    # gepa.optimize still adds its own max_metric_calls stopper (and a gepa.stop
+    # file stopper inside the log dir) next to these.
+    stoppers: list[Any] = [FileStopper(str(stop_file))]
+    if args.stop_after_stale is not None:
+        stoppers.append(NoImprovementStopper(int(args.stop_after_stale)))
+    if args.stop_at_score is not None:
+        stoppers.append(ScoreThresholdStopper(float(args.stop_at_score)))
+    if args.max_minutes is not None:
+        stoppers.append(TimeoutStopCondition(float(args.max_minutes) * 60))
+    inner: dict[str, Any] = {
+        "use_cloudpickle": True,
+        "callbacks": [GepaProgress(events, best_path, round_index)],
+        "stop_callbacks": stoppers,
+    }
+    proposals = int(args.proposals_per_iteration)
+    if proposals > 1:
+        from gepa.strategies.proposal_sampling import IndependentSampling
+        from gepa.strategies.proposal_selection import BestImprovement
+
+        inner["sampling_strategy"] = IndependentSampling(proposals)
+        inner["selection_strategy"] = BestImprovement()
+        inner["acceptance_criterion"] = "strict_improvement"
+    kwargs: dict[str, Any] = {"gepa_kwargs": inner}
+    if args.proposer_skill or args.proposer_note or args.proposer_max_chars is not None:
+        from dspy.teleprompt.gepa import InstructionProposer
+
+        kwargs["instruction_proposer"] = InstructionProposer(
+            skills=[proposer_skill_path(skill) for skill in args.proposer_skill] or None,
+            additional_instructions=args.proposer_note,
+            max_chars=int(args.proposer_max_chars) if args.proposer_max_chars is not None else None,
+        )
+    return kwargs
+
+
+def round_log_dir(log_dir: Path, round_index: int) -> Path:
+    # Each round is its own GEPA run. Round 1 keeps the bound log dir; later
+    # rounds resume from their own subdirectory under the same binding.
+    return log_dir if round_index == 1 else log_dir / f"round-{round_index}"
+
+
+def predictor_instructions(program: Any) -> dict[str, str]:
+    """Return each predictor's current instruction text, keyed by predictor name."""
+    named = getattr(program, "named_predictors", None)
+    if not callable(named):
+        return {}
+    return {
+        str(name): str(getattr(getattr(predictor, "signature", None), "instructions", ""))
+        for name, predictor in named()
+    }
+
+
+def gepa_run_stats(optimized: Any) -> dict[str, Any] | None:
+    """Summarize DspyGEPAResult (present because track_stats=True); None if absent."""
+    detailed = getattr(optimized, "detailed_results", None)
+    scores = getattr(detailed, "val_aggregate_scores", None)
+    if not scores:
+        return None
+    scores = [float(score) for score in scores]
+    best_idx = max(range(len(scores)), key=lambda index: scores[index])
+    return {
+        "split": "dev",
+        "num_candidates": len(scores),
+        "best_candidate_index": best_idx,
+        "baseline_val_score": scores[0],
+        "best_val_score": scores[best_idx],
+        "total_metric_calls": getattr(detailed, "total_metric_calls", None),
+        "num_full_val_evals": getattr(detailed, "num_full_val_evals", None),
+    }
+
+
+def score_program_on_rows(
+    program: Any,
+    rows: list[dict[str, Any]],
+    input_keys: list[str],
+    output_keys: list[str],
+    to_example: Callable[[dict[str, Any]], Any],
+    threads: int,
+    on_progress: Callable[[int, int, float], None] | None = None,
+    match_mode: str = "exact",
+) -> dict[str, Any]:
+    """Score a program on rows; spend errors abort, others count as failures.
+
+    The score follows match_mode, and both exact and case-insensitive scores are
+    always reported so a casing-only gain cannot pass for task skill.
+    """
+    progress_lock = threading.Lock()
+    finished = {"done": 0, "score": 0.0}
+
+    def record(score: float) -> None:
+        if on_progress is None:
+            return
+        with progress_lock:
+            finished["done"] += 1
+            finished["score"] += score
+            done, total_score = finished["done"], finished["score"]
+        # Report about ten times per pass, plus the last row.
+        step = max(1, len(rows) // 10)
+        if done % step == 0 or done == len(rows):
+            on_progress(done, len(rows), total_score / done)
+
+    def run(index: int) -> dict[str, Any]:
+        row = rows[index]
+        gold = to_example(row)
+        try:
+            prediction = program(**{key: row[key] for key in input_keys})
+        except Exception as error:
+            if spend_cause(error) is not None:
+                raise
+            record(0.0)
+            return {
+                "predicted": None,
+                "score": 0.0,
+                "by_match": {mode: 0.0 for mode in MATCH_MODES},
+                "error": type(error).__name__,
+            }
+        predicted = {key: str(getattr(prediction, key, "")).strip() for key in output_keys}
+        by_match = {
+            mode: float(exact_match_feedback(output_keys, gold, prediction, mode).score)
+            for mode in MATCH_MODES
+        }
+        score = by_match[match_mode]
+        record(score)
+        return {"predicted": predicted, "score": score, "by_match": by_match, "error": None}
+
+    with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
+        results = list(pool.map(run, range(len(rows))))
+    count = len(results)
+    return {
+        "score": sum(item["score"] for item in results) / count if count else 0.0,
+        "by_match": {
+            mode: (sum(item["by_match"][mode] for item in results) / count if count else 0.0)
+            for mode in MATCH_MODES
+        },
+        "errors": sum(1 for item in results if item["error"]),
+        "rows": results,
+    }
+
+
+def evaluate_holdout(
+    baseline: Any,
+    optimized: Any,
+    rows: list[dict[str, Any]],
+    input_keys: list[str],
+    output_keys: list[str],
+    to_example: Callable[[dict[str, Any]], Any],
+    threads: int,
+    ledger: SpendLedger,
+    events: RunEvents | None = None,
+    match_mode: str = "exact",
+) -> dict[str, Any]:
+    """Baseline vs optimized score on the holdout rows, after the candidate is frozen.
+
+    A spend stop mid-evaluation keeps the frozen candidate: the result is marked
+    incomplete instead of discarding it.
+    """
+    evaluation: dict[str, Any] = {
+        "schema_version": "understudy.dspy_gepa_holdout_evaluation.v1",
+        "status": "complete",
+        "count": len(rows),
+        "metric": "exact_match" if match_mode == "exact" else "case_insensitive_match",
+        "match_mode": match_mode,
+        "used_for_selection": False,
+        "baseline": None,
+        "optimized": None,
+        "delta": None,
+        "rows": [],
+    }
+
+    def reporter(program_name: str) -> Callable[[int, int, float], None] | None:
+        if events is None:
+            return None
+        return lambda done, total, running_score: events.emit(
+            "holdout-progress",
+            program=program_name,
+            done=done,
+            total=total,
+            running_score=round(running_score, 4),
+        )
+
+    failure_before = ledger.failure
+    try:
+        baseline_result = score_program_on_rows(
+            baseline, rows, input_keys, output_keys, to_example, threads, reporter("baseline"), match_mode,
+        )
+        evaluation["baseline"] = {
+            "score": baseline_result["score"],
+            "errors": baseline_result["errors"],
+            "by_match": baseline_result["by_match"],
+        }
+        optimized_result = score_program_on_rows(
+            optimized, rows, input_keys, output_keys, to_example, threads, reporter("optimized"), match_mode,
+        )
+        evaluation["optimized"] = {
+            "score": optimized_result["score"],
+            "errors": optimized_result["errors"],
+            "by_match": optimized_result["by_match"],
+        }
+    except Exception as error:
+        cause = spend_cause(error)
+        if cause is None:
+            raise
+        evaluation["status"] = (
+            "incomplete-budget" if isinstance(cause, SpendBudgetExceeded) else "incomplete-spend-evidence"
+        )
+        return evaluation
+    if ledger.failure is not None and ledger.failure is not failure_before:
+        # DSPy swallowed a spend stop and scored the row as a failure.
+        evaluation["status"] = (
+            "incomplete-budget"
+            if isinstance(ledger.failure, SpendBudgetExceeded)
+            else "incomplete-spend-evidence"
+        )
+        return evaluation
+    evaluation["delta"] = evaluation["optimized"]["score"] - evaluation["baseline"]["score"]
+    # Expected labels and predictions only; inputs stay out of the artifact.
+    evaluation["rows"] = [
+        {
+            "expected": {key: str(row[key]).strip() for key in output_keys},
+            "baseline": base["predicted"],
+            "optimized": opt["predicted"],
+            "baseline_score": base["score"],
+            "optimized_score": opt["score"],
+        }
+        for row, base, opt in zip(rows, baseline_result["rows"], optimized_result["rows"])
+    ]
+    return evaluation
+
+
+def holdout_summary(evaluation: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if evaluation is None:
+        return None
+    return {key: value for key, value in evaluation.items() if key != "rows"}
+
+
 def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
+    events: RunEvents = getattr(args, "events", None) or RunEvents(None)
     repo = Path(args.repo).resolve()
     run_dir = dspy_run_dir(args)
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1519,88 +2552,6 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
 
     import dspy
 
-    class BudgetedLM(dspy.LM):
-        def __init__(
-            self,
-            *lm_args: Any,
-            spend_ledger: SpendLedger,
-            role: str,
-            route_receipt: Mapping[str, Any],
-            **lm_kwargs: Any,
-        ) -> None:
-            self._spend_ledger = spend_ledger
-            self._role = role
-            self._route_receipt = dict(route_receipt)
-            super().__init__(*lm_args, **lm_kwargs)
-            if getattr(self, "model", None) != self._route_receipt["dspy_model"]:
-                raise ValueError(f"{role} DSPy model does not match the bound executed model")
-
-        def _output_token_ceiling(self, call_kwargs: dict[str, Any]) -> int:
-            value = (
-                call_kwargs.get("max_tokens")
-                or call_kwargs.get("max_completion_tokens")
-                or self.kwargs.get("max_tokens")
-                or self.kwargs.get("max_completion_tokens")
-            )
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError("LM call is missing a numeric output-token ceiling")
-            parsed = int(value)
-            if parsed <= 0 or parsed != value:
-                raise ValueError("LM output-token ceiling must be a positive integer")
-            return parsed
-
-        def _reserve_call(
-            self,
-            prompt: str | None,
-            messages: list[dict[str, Any]] | None,
-            call_kwargs: dict[str, Any],
-        ) -> int:
-            message_bytes, message_count = serialized_message_shape(prompt, messages)
-            return self._spend_ledger.reserve(
-                input_token_ceiling_from_bytes(message_bytes, message_count),
-                self._output_token_ceiling(call_kwargs),
-                {
-                    "role": self._role,
-                    "route_id": self._route_receipt["route_id"],
-                    "route_binding_sha256": self._route_receipt["route_binding_sha256"],
-                    "requested_model": self._route_receipt["requested_model"],
-                    "executed_model": self._route_receipt["executed_model"],
-                    "dspy_model": self._route_receipt["dspy_model"],
-                    "base_url_sha256": self._route_receipt["base_url_sha256"],
-                    "base_host_sha256": self._route_receipt["base_host_sha256"],
-                },
-            )
-
-        def forward(
-            self,
-            prompt: str | None = None,
-            messages: list[dict[str, Any]] | None = None,
-            **kwargs: Any,
-        ) -> Any:
-            call_id = self._reserve_call(prompt, messages, kwargs)
-            try:
-                response = super().forward(prompt=prompt, messages=messages, **kwargs)
-            except BaseException:
-                self._spend_ledger.mark_error(call_id)
-                raise
-            self._spend_ledger.complete(call_id, response)
-            return response
-
-        async def aforward(
-            self,
-            prompt: str | None = None,
-            messages: list[dict[str, Any]] | None = None,
-            **kwargs: Any,
-        ) -> Any:
-            call_id = self._reserve_call(prompt, messages, kwargs)
-            try:
-                response = await super().aforward(prompt=prompt, messages=messages, **kwargs)
-            except BaseException:
-                self._spend_ledger.mark_error(call_id)
-                raise
-            self._spend_ledger.complete(call_id, response)
-            return response
-
     gateway_url = os.environ.get("UNDERSTUDY_GATEWAY_URL")
     student_route, student_api_key, student_api_base = resolve_lm_route(
         "student", args.model, bridge_config, gateway_url,
@@ -1608,6 +2559,35 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
     reflection_route, reflection_api_key, reflection_api_base = resolve_lm_route(
         "reflection", args.reflection_model, bridge_config, gateway_url,
     )
+    # Gateway-published prices apply only to roles that execute on the gateway;
+    # a bridge route to another provider keeps its flag or global price.
+    gateway_roles = {
+        role
+        for role, route in (("student", student_route), ("reflection", reflection_route))
+        if route["route_id"] == "understudy-gateway"
+    }
+    if args.prices_from_gateway == "off":
+        ledger.set_gateway_prices({}, {"status": "off"}, set())
+    elif not gateway_roles:
+        if args.prices_from_gateway == "require":
+            raise ValueError("--prices-from-gateway require needs a gateway-routed model")
+        ledger.set_gateway_prices({}, {"status": "no-gateway-routed-roles"}, set())
+    else:
+        wanted = {
+            str(normalize_price_key(route["requested_model"]))
+            for role, route in (("student", student_route), ("reflection", reflection_route))
+            if role in gateway_roles
+        }
+        gateway_prices, lookup = fetch_gateway_prices(
+            str(gateway_url), os.environ.get("UNDERSTUDY_API_KEY", ""), wanted,
+        )
+        ledger.set_gateway_prices(gateway_prices, lookup, gateway_roles)
+        if args.prices_from_gateway == "require" and sorted(wanted - set(gateway_prices)):
+            raise ValueError("the gateway published no prices for a gateway-routed model")
+    if ledger.enforce:
+        for role, route in (("student", student_route), ("reflection", reflection_route)):
+            if ledger.prices_for(route["requested_model"], role) is None:
+                raise ValueError(f"no price basis for the {role} model")
 
     rows = load_rows(args.samples) if args.samples else []
     input_keys = split_keys(args.input_keys or "")
@@ -1627,6 +2607,17 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
             row for row in rows
             if str(row.get(args.split_key, "")).lower() == "holdout"
         ])
+    # Holdout rows are loaded only for the opt-in evaluation that runs after the
+    # candidate is frozen; they never reach GEPA, the metric, or a stopper.
+    holdout_rows = holdout_rows_for(rows, args.split_key) if args.evaluate_holdout else []
+    if args.evaluate_holdout:
+        if not holdout_rows:
+            raise ValueError(f"--evaluate-holdout needs rows with {args.split_key}=holdout")
+        for row in holdout_rows:
+            missing = [key for key in [*input_keys, *output_keys] if key not in row]
+            if missing:
+                raise ValueError("holdout row is missing keys")
+    events.emit("data-loaded", train=len(train_rows), dev=len(dev_rows), holdout=holdout_count)
 
     config_base = {
         "schema_version": "understudy.dspy_gepa_config.v2",
@@ -1669,9 +2660,17 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
             "track_stats": args.track_stats,
             "track_best_outputs": True,
             "log_dir": logical_path(repo, Path(args.log_dir)),
+            "round_log_dirs": "round 1 uses log_dir; round N uses log_dir/round-N",
+        },
+        "search": search_settings(args, repo),
+        "evaluation": {
+            "evaluate_holdout": bool(args.evaluate_holdout),
+            "holdout_used_for_selection": False,
+            "match_mode": args.match_mode,
         },
         "inference": {
             "max_tokens": args.max_tokens,
+            "reflection_max_tokens": args.reflection_max_tokens,
             "student_sampling": {
                 "temperature": args.temperature,
                 "reasoning_effort": args.reasoning_effort,
@@ -1690,7 +2689,12 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
             "optimizer_inference_cap_usd": ledger.budget_usd,
             "input_usd_per_million": ledger.input_usd_per_million,
             "output_usd_per_million": ledger.output_usd_per_million,
-            "price_basis_scope": "conservative-user-supplied-basis-for-both-models",
+            "price_basis_scope": (
+                "conservative-user-supplied-basis-for-both-models"
+                if ledger.reflection_prices is None and not ledger.model_prices and not ledger.gateway_prices
+                else "per-call-resolved-reflection-model-gateway-global"
+            ),
+            "prices": ledger.price_configuration(),
         },
         "budget_allocation": budget_allocation,
     }
@@ -1737,39 +2741,52 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
         else None
     )
 
-    student_lm_kwargs = {
-        "api_key": student_api_key,
-        "api_base": student_api_base,
-        "max_tokens": args.max_tokens,
-        "temperature": args.temperature,
-        "cache": False,
-        "num_retries": 0,
-    }
-    if args.reasoning_effort != "none":
-        student_lm_kwargs["reasoning_effort"] = args.reasoning_effort
-    student_lm = BudgetedLM(
-        student_route["dspy_model"],
-        spend_ledger=ledger,
-        role="student",
-        route_receipt=student_route,
-        **student_lm_kwargs,
+    def build_lm(
+        role: str,
+        route: Mapping[str, Any],
+        api_key: str,
+        api_base: str,
+        max_tokens: int,
+        temperature: float,
+        reasoning_effort: str,
+    ) -> Any:
+        # A custom engine owns the connection, so the credential and base URL go
+        # on the inner engine, never on dspy.LM. Every call crosses the meter.
+        engine = MeteredEngine(new_provider_engine(api_key, api_base), ledger, role, route)
+        lm_kwargs: dict[str, Any] = {
+            "engine": engine,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "cache": False,
+            "num_retries": 0,
+        }
+        if reasoning_effort != "none":
+            lm_kwargs["reasoning_effort"] = reasoning_effort
+        lm = dspy.LM(route["dspy_model"], **lm_kwargs)
+        if getattr(lm, "model", None) != route["dspy_model"]:
+            raise ValueError(f"{role} DSPy model does not match the bound executed model")
+        return lm
+
+    student_lm = build_lm(
+        "student",
+        student_route,
+        student_api_key,
+        student_api_base,
+        args.max_tokens,
+        args.temperature,
+        args.reasoning_effort,
     )
-    reflection_lm_kwargs = {
-        "api_key": reflection_api_key,
-        "api_base": reflection_api_base,
-        "max_tokens": args.max_tokens,
-        "temperature": args.reflection_temperature,
-        "cache": False,
-        "num_retries": 0,
-    }
-    if args.reflection_reasoning_effort != "none":
-        reflection_lm_kwargs["reasoning_effort"] = args.reflection_reasoning_effort
-    reflection_lm = BudgetedLM(
-        reflection_route["dspy_model"],
-        spend_ledger=ledger,
-        role="reflection",
-        route_receipt=reflection_route,
-        **reflection_lm_kwargs,
+    # GEPA reflection returns a structured instruction proposal that is far
+    # longer than a student answer; a student-sized cap truncates it and the
+    # proposal silently fails, so reflection has its own output cap.
+    reflection_lm = build_lm(
+        "reflection",
+        reflection_route,
+        reflection_api_key,
+        reflection_api_base,
+        args.reflection_max_tokens,
+        args.reflection_temperature,
+        args.reflection_reasoning_effort,
     )
     if student_lm is reflection_lm:
         raise ValueError("student and reflection LMs must be separate instances")
@@ -1793,11 +2810,22 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
 
         trainset = [to_example(row) for row in train_rows]
         valset = [to_example(row) for row in dev_rows]
+        baseline_instructions = predictor_instructions(student)
+        # Optional warm start from a previous run; the unseeded student stays
+        # the holdout baseline. Seeds are validated before any provider call.
+        starting_program = student
+        if args.seed_instructions:
+            starting_program = copy.deepcopy(student)
+            apply_instructions(starting_program, load_seed_instructions(Path(args.seed_instructions)))
+            events.emit("seeded", instructions=predictor_instructions(starting_program))
+        args.phase = "baseline"
+        write_dspy_run_state(args, ledger, "running", None, phase="baseline")
+        events.emit("phase", name="baseline")
         baseline_prediction = student(**{key: train_rows[0][key] for key in input_keys})
-        baseline_feedback = exact_match_feedback(output_keys, trainset[0], baseline_prediction)
+        baseline_feedback = exact_match_feedback(output_keys, trainset[0], baseline_prediction, args.match_mode)
 
         def metric(gold: Any, pred: Any, trace: Any = None, pred_name: str | None = None, pred_trace: Any = None) -> Any:
-            return exact_match_feedback(output_keys, gold, pred)
+            return exact_match_feedback(output_keys, gold, pred, args.match_mode)
     else:
         builder = getattr(bridge_module, "build_understudy_dspy_gepa", None)
         if not callable(builder):
@@ -1814,6 +2842,8 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
             if key not in program:
                 raise ValueError(f"program bridge result is missing {key}")
         student = program["student"]
+        baseline_instructions = predictor_instructions(student)
+        starting_program = student
         trainset = list(program["trainset"])
         valset = list(program["valset"])
         metric = program["metric"]
@@ -1821,7 +2851,7 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
             raise ValueError("program bridge requires non-empty trainset/valset and a callable metric")
         teacher = program.get("teacher")
         if teacher is not None:
-            raise UnsupportedTeacherError("dspy-3.3.0-gepa-teacher-not-supported")
+            raise UnsupportedTeacherError("dspy-3.4.1-gepa-teacher-not-supported")
         exporter = program.get("export_candidate")
         if exporter is not None and not callable(exporter):
             raise ValueError("export_candidate must be callable")
@@ -1869,6 +2899,7 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
             "reflection": config_payload["inference"]["reflection_sampling"],
         }
         admission_spend_evidence["route_bindings"] = config_payload["inference"]["routes"]
+        args.phase = "admission"
         write_dspy_run_state(
             args,
             ledger,
@@ -1883,7 +2914,9 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
                 "optimizer_provider_calls": False,
                 "endpoint_provider_calls": bool(live_admission and live_admission.get("call_count", 0) > 0),
             },
+            phase="admission",
         )
+        events.emit("run-finished", status="admitted", optimizer_started=False)
         emit({
             "schema_version": "understudy.dspy_gepa_adapter.v2",
             "status": "admitted",
@@ -1900,23 +2933,73 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
         })
         return
 
-    teleprompter = dspy.GEPA(
-        metric=metric,
-        max_metric_calls=args.max_metric_calls,
-        reflection_minibatch_size=args.reflection_minibatch_size,
-        candidate_selection_strategy=args.candidate_selection_strategy,
-        reflection_lm=reflection_lm,
-        component_selector=args.component_selector,
-        use_merge=args.use_merge,
-        max_merge_invocations=args.max_merge_invocations,
-        num_threads=args.num_threads,
-        log_dir=str(log_dir),
-        track_stats=args.track_stats,
-        track_best_outputs=True,
-        seed=args.seed,
-        gepa_kwargs={"use_cloudpickle": True},
+    stop_file = dspy_stop_file_path(args)
+    if stop_file.exists():
+        # A stale STOP from an earlier run must not end this one.
+        stop_file.unlink()
+        events.emit("stop-file-cleared")
+    args.phase = "optimizing"
+    write_dspy_run_state(args, ledger, "running", None, {"config_sha256": config_sha256}, phase="optimizing")
+    events.emit("phase", name="optimizing", max_metric_calls=args.max_metric_calls, rounds=args.rounds)
+    rounds_log: list[dict[str, Any]] = []
+    program_to_climb = starting_program
+    optimized = starting_program
+    for round_index in range(1, args.rounds + 1):
+        round_dir = round_log_dir(log_dir, round_index)
+        round_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        teleprompter = dspy.GEPA(
+            metric=metric,
+            max_metric_calls=args.max_metric_calls,
+            reflection_minibatch_size=args.reflection_minibatch_size,
+            candidate_selection_strategy=args.candidate_selection_strategy,
+            reflection_lm=reflection_lm,
+            component_selector=args.component_selector,
+            use_merge=args.use_merge,
+            max_merge_invocations=args.max_merge_invocations,
+            num_threads=args.num_threads,
+            log_dir=str(round_dir),
+            track_stats=args.track_stats,
+            track_best_outputs=True,
+            seed=args.seed,
+            **build_gepa_search_kwargs(args, events, stop_file, dspy_best_so_far_path(args), round_index),
+        )
+        events.emit("round-started", round=round_index, of=args.rounds)
+        optimized = teleprompter.compile(program_to_climb, trainset=trainset, valset=valset)
+        if ledger.failure is not None:
+            # DSPy scores a failed rollout as a miss; a spend stop is never a miss.
+            raise ledger.failure
+        round_stats = gepa_run_stats(optimized)
+        stopped_by_file = stop_file.exists()
+        seed_score = round_stats["baseline_val_score"] if round_stats else None
+        best_score = round_stats["best_val_score"] if round_stats else None
+        entry = {
+            "round": round_index,
+            "seed_val_score": seed_score,
+            "best_val_score": best_score,
+            "gain": (best_score - seed_score) if seed_score is not None and best_score is not None else None,
+            "metric_calls": round_stats["total_metric_calls"] if round_stats else None,
+            "stopped_by_stop_file": stopped_by_file,
+        }
+        rounds_log.append(entry)
+        events.emit("round-finished", **entry)
+        program_to_climb = optimized
+        # Every stop below reads the dev split only.
+        if stopped_by_file:
+            break
+        if best_score is not None and best_score >= 1.0:
+            break
+        if entry["gain"] is not None and entry["gain"] <= args.min_round_gain:
+            break
+    optimized_instructions = predictor_instructions(optimized)
+    instructions_changed = optimized_instructions != baseline_instructions
+    final_stats = gepa_run_stats(optimized)
+    args.phase = "optimization-finished"
+    events.emit(
+        "phase",
+        name="optimization-finished",
+        instructions_changed=instructions_changed,
+        gepa_stats=final_stats,
     )
-    optimized = teleprompter.compile(student, trainset=trainset, valset=valset)
     program_state = optimized_program_state(optimized, bridge_state)
     program_state["config_sha256"] = config_sha256
     write_owner_only_json(run_dir / "program-state.json", program_state)
@@ -1934,12 +3017,17 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
             args, optimized, exporter, export_context, config_sha256,
         )
 
-    spend_evidence = ledger.evidence()
-    spend_evidence["sampling"] = {
-        "student": config_payload["inference"]["student_sampling"],
-        "reflection": config_payload["inference"]["reflection_sampling"],
-    }
-    spend_evidence["route_bindings"] = config_payload["inference"]["routes"]
+    def sampled_spend_evidence() -> dict[str, Any]:
+        evidence = ledger.evidence()
+        evidence["sampling"] = {
+            "student": config_payload["inference"]["student_sampling"],
+            "reflection": config_payload["inference"]["reflection_sampling"],
+        }
+        evidence["route_bindings"] = config_payload["inference"]["routes"]
+        return evidence
+
+    holdout_path = dspy_holdout_evaluation_path(args)
+    spend_evidence = sampled_spend_evidence()
     candidate = {
         "schema_version": "understudy.dspy_gepa_candidate.v2",
         "adapter": "dspy-gepa",
@@ -1953,8 +3041,20 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
         "dev_count": len(valset),
         "holdout_count_excluded": holdout_count,
         "max_metric_calls": args.max_metric_calls,
+        "max_tokens": args.max_tokens,
+        "reflection_max_tokens": args.reflection_max_tokens,
+        "spend_enforcement": spend_evidence["spend_enforcement"],
         "baseline_first_score": float(baseline_feedback.score) if baseline_feedback else None,
         "baseline_first_feedback": baseline_feedback.feedback if baseline_feedback else None,
+        "baseline_instructions": baseline_instructions,
+        "optimized_instructions": optimized_instructions,
+        "instructions_changed": instructions_changed,
+        "gepa_stats": final_stats,
+        "search": config_payload["search"],
+        "rounds": rounds_log,
+        # The candidate is frozen here, before any holdout row is scored.
+        "holdout_evaluation_requested": bool(args.evaluate_holdout),
+        "holdout_evaluation_path": artifact_path(repo, holdout_path) if args.evaluate_holdout else None,
         "optimized_program_class": optimized.__class__.__name__,
         "config_sha256": config_sha256,
         "budget_allocation": budget_allocation,
@@ -1968,6 +3068,32 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
     candidate_path = optimize_dir / "candidate.json"
     proof_path = optimize_dir / "proof-packet.json"
     write_owner_only_json(candidate_path, candidate)
+    candidate_sha256 = file_sha256(candidate_path)
+
+    holdout_evaluation: dict[str, Any] | None = None
+    if args.evaluate_holdout:
+        # Scored once, after optimization and after the candidate is frozen, so
+        # the holdout never influences selection. Both programs share the ledger.
+        args.phase = "evaluating-holdout"
+        write_dspy_run_state(args, ledger, "running", None, {"config_sha256": config_sha256}, phase="evaluating-holdout")
+        events.emit("phase", name="evaluating-holdout", rows=len(holdout_rows))
+        holdout_evaluation = evaluate_holdout(
+            student,
+            optimized,
+            holdout_rows,
+            input_keys,
+            output_keys,
+            to_example,
+            args.num_threads,
+            ledger,
+            events,
+            args.match_mode,
+        )
+        holdout_evaluation["candidate_sha256"] = candidate_sha256
+        holdout_evaluation["config_sha256"] = config_sha256
+        write_owner_only_json(holdout_path, holdout_evaluation)
+
+    spend_evidence = sampled_spend_evidence()
     proof = {
         "schema_version": "understudy.optimize-workload.proof.v1",
         "mode": "dspy-gepa",
@@ -1978,9 +3104,13 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
         "live_optimizer_execution": True,
         "package_installs": True,
         "holdout_accessed_during_optimization": False,
+        "holdout_evaluated_after_optimization": holdout_evaluation is not None,
+        "holdout_evaluation": holdout_summary(holdout_evaluation),
+        "spend_enforcement": spend_evidence["spend_enforcement"],
         "train_count": len(trainset),
         "dev_count": len(valset),
         "candidate": artifact_path(repo, candidate_path),
+        "candidate_sha256": candidate_sha256,
         "config_sha256": config_sha256,
         "budget_allocation": budget_allocation,
         "bundle_sha256": bundle_manifest["bundle_sha256"] if bundle_manifest else None,
@@ -1990,11 +3120,22 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
     write_owner_only_json(proof_path, proof)
     extra = {
         "config_sha256": config_sha256,
+        "candidate_sha256": candidate_sha256,
         "budget_allocation": budget_allocation,
         "bundle_sha256": bundle_manifest["bundle_sha256"] if bundle_manifest else None,
         "route_bindings": config_payload["inference"]["routes"],
     }
-    write_dspy_run_state(args, ledger, "candidate-created", None, extra)
+    args.phase = "finished"
+    write_dspy_run_state(args, ledger, "candidate-created", None, extra, phase="finished")
+    events.emit(
+        "run-finished",
+        status="candidate-created",
+        calls_completed=spend_evidence["calls_completed"],
+        attributed_cost_usd=spend_evidence["attributed_cost_usd"],
+        instructions_changed=instructions_changed,
+        gepa_stats=final_stats,
+        holdout_evaluation=holdout_summary(holdout_evaluation),
+    )
     emit({
         "schema_version": "understudy.dspy_gepa_adapter.v2",
         "status": "candidate-created",
@@ -2014,14 +3155,19 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
         "train_count": len(trainset),
         "dev_count": len(valset),
         "holdout_count_excluded": holdout_count,
+        "holdout_evaluation": holdout_summary(holdout_evaluation),
         "max_metric_calls": args.max_metric_calls,
+        "instructions_changed": instructions_changed,
+        "spend_enforcement": spend_evidence["spend_enforcement"],
         "config_sha256": config_sha256,
+        "candidate_sha256": candidate_sha256,
         "budget_allocation": budget_allocation,
         "bundle_sha256": bundle_manifest["bundle_sha256"] if bundle_manifest else None,
         "canonical_bundle_sha256": bundle_manifest["canonical_bundle_sha256"] if bundle_manifest else None,
         "candidate_path": artifact_path(repo, candidate_path),
         "proof_packet_path": artifact_path(repo, proof_path),
         "run_state_path": artifact_path(repo, dspy_run_state_path(args)),
+        "events_path": artifact_path(repo, dspy_events_path(args)),
         "artifacts": dspy_artifacts(args),
         "spend_evidence": spend_evidence,
     })
@@ -2030,39 +3176,87 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
 def dspy_gepa(args: argparse.Namespace) -> None:
     if args.log_dir is None:
         args.log_dir = str(dspy_run_dir(args) / "gepa-log")
-    ledger = SpendLedger(
-        args.budget_usd,
-        args.input_usd_per_million,
-        args.output_usd_per_million,
+    args.phase = "setup"
+    events = RunEvents(dspy_events_path(args), echo=args.progress)
+    args.events = events
+    try:
+        ledger = SpendLedger(
+            args.budget_usd,
+            args.input_usd_per_million,
+            args.output_usd_per_million,
+            args.reflection_input_usd_per_million,
+            args.reflection_output_usd_per_million,
+            parse_model_prices(args.model_price),
+            enforce=not args.no_spend_ledger,
+        )
+    except ValueError:
+        events.emit("run-failed", status="error", reason="invalid-spend-configuration")
+        emit({
+            "schema_version": "understudy.dspy_gepa_adapter.v2",
+            "status": "error",
+            "reason": "invalid-spend-configuration",
+            "adapter": "dspy-gepa",
+            "model": args.model,
+            "reflection_model": args.reflection_model,
+            "provider_calls": False,
+            "optimizer_execution": False,
+        })
+        raise SystemExit(3)
+    ledger.observer = events.ledger_event
+    try:
+        validate_search_options(args)
+        if args.no_spend_ledger and args.program_bridge:
+            raise ValueError("--no-spend-ledger is not supported with --program-bridge")
+    except ValueError:
+        emit_dspy_failure(args, ledger, "error", "invalid-runtime-input", 3)
+    events.emit(
+        "run-started",
+        model=args.model,
+        reflection_model=args.reflection_model,
+        spend_enforcement="ledger" if ledger.enforce else "none",
+        approved_budget_usd=ledger.budget_usd,
+        max_metric_calls=args.max_metric_calls,
+        max_tokens=args.max_tokens,
+        reflection_max_tokens=args.reflection_max_tokens,
+        evaluate_holdout=bool(args.evaluate_holdout),
+        admission_only=bool(args.admission_only),
+        rounds=args.rounds,
+        proposals_per_iteration=args.proposals_per_iteration,
+        match_mode=args.match_mode,
     )
     try:
         _dspy_gepa_execute(args, ledger)
-    except SpendBudgetExceeded:
-        emit_dspy_failure(
-            args,
-            ledger,
-            "budget-blocked",
-            "next-call-reservation-exceeds-budget",
-            4,
-        )
-    except SpendEvidenceError as error:
-        emit_dspy_failure(args, ledger, "spend-evidence-error", str(error), 5)
-    except RuntimePackageVersionError:
-        emit_dspy_failure(args, ledger, "error", "runtime-package-version-mismatch", 3)
-    except ResumeBindingError as error:
-        emit_dspy_failure(args, ledger, "resume-blocked", str(error), 6)
-    except WorkloadAdmissionError as error:
-        emit_dspy_failure(args, ledger, "admission-blocked", str(error), 6)
-    except UnsupportedTeacherError as error:
-        emit_dspy_failure(args, ledger, "error", str(error), 3)
     except KeyboardInterrupt:
         emit_dspy_failure(args, ledger, "cancelled", "optimizer-cancelled", 130)
-    except ImportError:
-        emit_dspy_failure(args, ledger, "error", "runtime-dependency-error", 3)
-    except ValueError:
-        emit_dspy_failure(args, ledger, "error", "invalid-runtime-input", 3)
-    except Exception:
-        emit_dspy_failure(args, ledger, "error", "optimizer-execution-failed", 3)
+    except Exception as error:
+        # DSPy wraps errors raised inside an engine call, and GEPA may score a
+        # failed rollout as a miss, so a spend stop is found in the exception
+        # chain or in the ledger itself before the error type decides.
+        cause = spend_cause(error) or ledger.failure
+        if isinstance(cause, SpendBudgetExceeded):
+            emit_dspy_failure(
+                args,
+                ledger,
+                "budget-blocked",
+                "next-call-reservation-exceeds-budget",
+                4,
+            )
+        elif isinstance(cause, SpendEvidenceError):
+            emit_dspy_failure(args, ledger, "spend-evidence-error", str(cause), 5)
+        elif isinstance(error, RuntimePackageVersionError):
+            emit_dspy_failure(args, ledger, "error", "runtime-package-version-mismatch", 3)
+        elif isinstance(error, ResumeBindingError):
+            emit_dspy_failure(args, ledger, "resume-blocked", str(error), 6)
+        elif isinstance(error, WorkloadAdmissionError):
+            emit_dspy_failure(args, ledger, "admission-blocked", str(error), 6)
+        elif isinstance(error, UnsupportedTeacherError):
+            emit_dspy_failure(args, ledger, "error", str(error), 3)
+        elif isinstance(error, ImportError):
+            emit_dspy_failure(args, ledger, "error", "runtime-dependency-error", 3)
+        elif isinstance(error, ValueError):
+            emit_dspy_failure(args, ledger, "error", "invalid-runtime-input", 3)
+        else:
+            emit_dspy_failure(args, ledger, "error", "optimizer-execution-failed", 3)
     finally:
         for root in (dspy_run_dir(args), Path(args.log_dir)):
             try:
@@ -2410,7 +3604,8 @@ def main() -> None:
     dspy_gepa_parser.add_argument("--split-key", default="split")
     dspy_gepa_parser.add_argument("--train-split", default="train")
     dspy_gepa_parser.add_argument("--dev-split", default="dev")
-    dspy_gepa_parser.add_argument("--max-tokens", type=positive_int_arg, default=256)
+    dspy_gepa_parser.add_argument("--max-tokens", type=positive_int_arg, default=2048)
+    dspy_gepa_parser.add_argument("--reflection-max-tokens", type=positive_int_arg, default=2048)
     dspy_gepa_parser.add_argument("--temperature", type=non_negative_float_arg, default=0.1)
     dspy_gepa_parser.add_argument(
         "--reasoning-effort", choices=("none", "minimal", "low", "medium", "high"), default="none",
@@ -2421,9 +3616,16 @@ def main() -> None:
         choices=("none", "minimal", "low", "medium", "high"),
         default="none",
     )
-    dspy_gepa_parser.add_argument("--budget-usd", required=True)
-    dspy_gepa_parser.add_argument("--input-usd-per-million", required=True)
-    dspy_gepa_parser.add_argument("--output-usd-per-million", required=True)
+    dspy_gepa_parser.add_argument("--budget-usd", default=None)
+    dspy_gepa_parser.add_argument("--input-usd-per-million", default=None)
+    dspy_gepa_parser.add_argument("--output-usd-per-million", default=None)
+    dspy_gepa_parser.add_argument("--reflection-input-usd-per-million", default=None)
+    dspy_gepa_parser.add_argument("--reflection-output-usd-per-million", default=None)
+    dspy_gepa_parser.add_argument("--model-price", action="append", default=[])
+    dspy_gepa_parser.add_argument(
+        "--prices-from-gateway", choices=("auto", "off", "require"), default="auto",
+    )
+    dspy_gepa_parser.add_argument("--no-spend-ledger", action="store_true")
     dspy_gepa_parser.add_argument("--reflection-minibatch-size", type=positive_int_arg, default=1)
     dspy_gepa_parser.add_argument(
         "--candidate-selection-strategy", choices=("pareto", "current_best"), default="pareto",
@@ -2442,6 +3644,21 @@ def main() -> None:
     dspy_gepa_parser.add_argument("--program-project", default=None)
     dspy_gepa_parser.add_argument("--admission-only", action="store_true")
     dspy_gepa_parser.add_argument("--admission-receipt", default=None)
+    dspy_gepa_parser.add_argument("--evaluate-holdout", action="store_true")
+    dspy_gepa_parser.add_argument("--match-mode", choices=MATCH_MODES, default="exact")
+    dspy_gepa_parser.add_argument("--seed-instructions", default=None)
+    # Search settings are parsed by validate_search_options so a bad value
+    # fails with the run's JSON error payload instead of an argparse exit.
+    dspy_gepa_parser.add_argument("--rounds", default="1")
+    dspy_gepa_parser.add_argument("--min-round-gain", default="0")
+    dspy_gepa_parser.add_argument("--stop-after-stale", default=None)
+    dspy_gepa_parser.add_argument("--stop-at-score", default=None)
+    dspy_gepa_parser.add_argument("--max-minutes", default=None)
+    dspy_gepa_parser.add_argument("--proposals-per-iteration", default="1")
+    dspy_gepa_parser.add_argument("--proposer-skill", action="append", default=[])
+    dspy_gepa_parser.add_argument("--proposer-note", default=None)
+    dspy_gepa_parser.add_argument("--proposer-max-chars", default=None)
+    dspy_gepa_parser.add_argument("--progress", action="store_true")
     dspy_gepa_parser.set_defaults(func=dspy_gepa)
 
     eval_input_gepa_parser = sub.add_parser("eval-input-gepa")
