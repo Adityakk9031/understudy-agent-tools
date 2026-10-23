@@ -142,7 +142,11 @@ validator kinds in [`reference.md`](reference.md):
    `--proposals-per-iteration` and the `--proposer-*` flags to climb past one
    pass, and `--evaluate-holdout` to score baseline vs optimized once after the
    candidate is frozen. Select on the dev split and read the holdout once; use
-   `--match-mode case-insensitive` when casing is not part of the task. The
+   `--match-mode case-insensitive` when casing is not part of the task. For a
+   workload with several labeled outputs (urgency, sentiment, a category set),
+   declare one typed predictor per output in a `--task-spec` JSON instead of
+   `--output-keys`: labels become `Literal` types, each predictor gets its own
+   feedback, and `--frontier-type hybrid` can keep per-predictor winners. The
    flag reference, event schema, and noise caveats are in
    [`docs/dspy-gepa-hill-climbing.md`](../../docs/dspy-gepa-hill-climbing.md). GEPA's
    edge is natural-language feedback: the metric must return a diagnosis of

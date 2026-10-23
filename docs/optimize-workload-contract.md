@@ -198,9 +198,19 @@ Climb and search controls are hash-bound into the same config:
 `--proposals-per-iteration` (GEPA 0.1.4 `IndependentSampling` plus
 `BestImprovement`), and `--proposer-skill`/`--proposer-note`/
 `--proposer-max-chars` (DSPy's `InstructionProposer`; skill files are bound by
-content hash). `--seed-instructions`, `--match-mode`, and `--evaluate-holdout`
-act on the built-in signature scaffold and are refused for program bridges.
-Every stop and selection reads the dev split only.
+content hash). `--seed-instructions`, `--match-mode`, `--evaluate-holdout`,
+and `--task-spec` act on the built-in scaffold and are refused for program
+bridges. `--component-selector` and `--frontier-type` are recorded in `search`;
+`objective`, `hybrid`, and `cartesian` frontiers need a task spec. Every stop
+and selection reads the dev split only.
+
+A `--task-spec` (`understudy.dspy_gepa_task_spec.v1`) replaces
+`--input-keys`/`--output-keys` with several typed predictors. The CLI requires a
+regular, non-symlink, owner-readable file; the runtime re-validates it, binds
+its content hash and normalized form into the config, and checks every used
+sample row's gold values against it before any provider call, failing with the
+row index and predictor name only. The schema and scoring are in
+[`dspy-gepa-hill-climbing.md`](dspy-gepa-hill-climbing.md#multi-predictor-task-specs).
 
 Spend is metered at the DSPy engine seam: each LM owns a metering engine that
 wraps DSPy's LiteLLM engine, so every `complete(Request)` reserves before and

@@ -9,7 +9,8 @@ The safety contract (exact package receipts, the spend ledger, hash-bound
 config and resume, program-bridge admission, holdout exclusion) is in
 [`optimize-workload-contract.md`](optimize-workload-contract.md). This guide
 covers the built-in path: optimizing the instruction text of one
-`dspy.Predict` or `dspy.ChainOfThought` signature against labels. Optimizer
+`dspy.Predict` or `dspy.ChainOfThought` signature against labels, or of several
+typed predictors declared in a [task spec](#multi-predictor-task-specs). Optimizer
 implementation stays upstream: the runtime is a thin metered wrapper around
 `dspy.GEPA`, installed per run with `uv run --no-project --python 3.13 --with
 dspy==3.4.1 --with 'gepa[dspy]==0.1.4' --with cloudpickle==3.1.2 --with
@@ -71,11 +72,15 @@ and the GEPA log behind. Two ways back:
 | Climb rounds | `--rounds N`, `--min-round-gain G` | 1, 0 | Restart GEPA from the previous round's best prompt; stop when a round gains no more than G on the dev split, or reaches a perfect dev score |
 | Holdout evaluation | `--evaluate-holdout` | off | Scores baseline and optimized once on the holdout, after the candidate is frozen. Always reports exact and case-insensitive scores (`by_match`) |
 | Label comparison | `--match-mode exact\|case-insensitive` | exact | `case-insensitive` also ignores repeated whitespace. In `exact` mode the feedback tells the reflector when a miss "differs only in letter case" |
+| Multi-predictor programs, typed `Literal` outputs, per-predictor feedback | `--task-spec PATH` | none | One typed predictor per output, each with its own instruction for GEPA to rewrite and its own feedback. Replaces `--input-keys`/`--output-keys`. See [Multi-predictor task specs](#multi-predictor-task-specs) |
+| Component selection (`component_selector`) | `--component-selector round_robin\|all` | round_robin | With several predictors, `round_robin` rewrites one per iteration and `all` rewrites every predictor from the same minibatch |
+| Pareto frontier (`gepa_kwargs["frontier_type"]`) | `--frontier-type instance\|objective\|hybrid\|cartesian` | instance | `objective` keeps the best candidate per predictor score, `hybrid` keeps both per-row and per-predictor winners, `cartesian` keeps per-row-per-predictor winners. All but `instance` need `--task-spec`, whose metric returns `objective_scores` |
 
-`--seed-instructions`, `--evaluate-holdout`, and `--match-mode` act on the
-built-in signature scaffold. A `--program-bridge` owns its own seed program,
-metric, and holdout, so those flags are refused there; the stoppers, rounds,
-proposal strategy, and proposer flags work for both.
+`--seed-instructions`, `--evaluate-holdout`, `--match-mode`, and `--task-spec`
+act on the built-in scaffold. A `--program-bridge` owns its own seed program,
+metric, and holdout, so those flags are refused there (and with them the
+objective frontiers, which need a spec); the stoppers, rounds, proposal
+strategy, component selector, and proposer flags work for both.
 
 Spend controls, independent of the search:
 
@@ -92,6 +97,112 @@ Price resolution per call: reflection flags, then `--model-price`, then gateway
 prices, then the global basis. A model with no price from any of them stops the
 run before the first provider call. The resolved prices are part of the
 hash-bound config.
+
+## Multi-predictor task specs
+
+A task spec declares the program instead of one `--output-keys` signature: one
+`dspy.Predict` or `dspy.ChainOfThought` per predictor, each with a typed output
+field and its own instruction for GEPA to rewrite. It is the shape of DSPy's
+[GEPA Facility Support Analyzer tutorial](https://dspy.ai/current/tutorials/gepa_facilitysupportanalyzer/),
+expressed without user Python. Pass it with `--task-spec PATH`; it replaces
+`--input-keys` and `--output-keys` (passing either with a spec is an error) and
+is refused with `--program-bridge`.
+
+Schema `understudy.dspy_gepa_task_spec.v1`:
+
+| Field | Required | Meaning |
+|---|---|---|
+| `schema_version` | yes | `understudy.dspy_gepa_task_spec.v1` |
+| `description` | no | Free text for people; ignored by the runtime |
+| `inputs` | yes | Input field names every predictor reads (unique identifiers; `reasoning` is reserved) |
+| `module` | no | `predict` (default) or `cot`. `--module`, if given, must agree |
+| `predictors[]` | yes, 1 to 32 | One entry per predictor |
+| `predictors[].name` | yes | `^[a-z][a-z0-9_]{0,63}$`, unique, not a `dspy.Module` member such as `forward` or `predictors` |
+| `predictors[].output` | no | Output field name and the sample-row key holding its gold value; defaults to `name`. Unique, not an input, not `reasoning` |
+| `predictors[].instructions` | no | Seed instruction text; DSPy's default ("Given the fields ...") when absent |
+| `predictors[].type.kind` | yes | `label`, `label-set`, or `text` |
+| `predictors[].type.labels` | for `label` and `label-set` | 1 to 256 unique strings without surrounding whitespace, unique ignoring case; not allowed for `text` |
+
+Unknown keys anywhere fail the spec. The CLI checks the file (regular,
+non-symlink, owner-readable, valid) before it resolves credentials, and the
+runtime validates it again. The file is bound into the run config by content
+hash and by its normalized form, so editing it stops a resume with
+`resume-log-config-mismatch`.
+
+Each kind sets the output field's type, its gold format in the sample rows, and
+how it is scored:
+
+| `kind` | DSPy output type | Gold value in a sample row | Score for that predictor |
+|---|---|---|---|
+| `label` | `Literal[...labels]` | one label string | 1 if the prediction matches under `--match-mode`, else 0 |
+| `label-set` | `list[Literal[...labels]]` | a list of labels, or a `{label: true/false}` object (the tutorial's format; absent labels count as false) | Per-label agreement over the spec's label set: (labels correctly included + labels correctly left out) / number of labels |
+| `text` | `str` | a string | 1 if it matches under `--match-mode` (exact or case-insensitive, as without a spec), else 0 |
+
+Typed outputs matter: DSPy tells the student the allowed labels and rejects
+anything else at parse time. In the tutorial reproduction, typing a single
+urgency predictor as a `Literal` lifted its baseline from 20% to 57% before any
+optimization.
+
+Every sample row that is used (train and dev, and holdout rows when
+`--evaluate-holdout` is set) is checked against the spec before any provider
+call. A missing input, a missing gold value, or a gold label outside the label
+set stops the run with a reason such as `task-spec-gold-invalid: sample row 12,
+predictor urgency: label is not in the spec's label set`. The reason names the
+row's index in the samples file and never quotes the row.
+
+The metric returns the mean of the predictor scores as the GEPA score, with
+`objective_scores` holding each predictor's score. When GEPA asks for feedback
+on one predictor (`pred_name`), it gets that predictor's text in the tutorial's
+style: correct or incorrect plus the expected label, and for a label set the
+labels correctly included, wrongly included, and missed. DSPy 3.4.1 passes
+`pred_name` as `<name>.predict` for `cot` and `<name>` for `predict` (checked
+against the installed engine); anything else gets every predictor's feedback.
+
+What a spec run adds to the artifacts:
+
+- `candidate.json`: `predictors` (per predictor: `dspy_predictor`, `output`,
+  `kind`, baseline and optimized instructions, `instructions_changed`),
+  `instructions_changed_by_predictor`, `baseline_first_objective_scores`, and
+  `task_spec`. `baseline_instructions` and `optimized_instructions` stay keyed by
+  DSPy predictor name (`urgency.predict`), as in `best-so-far.json`.
+- `holdout-evaluation.json`: `aggregate: "mean-of-predictor-scores"`,
+  `predictors`, `by_predictor` (score and both match modes per predictor) for
+  baseline and optimized, and `delta_by_predictor`. Rows keep expected and
+  predicted outputs only, with label sets as label lists.
+- `--seed-instructions` accepts a `{predictor: text}` object keyed by spec name
+  (`urgency`) or DSPy name (`urgency.predict`), as well as `best-so-far.json`.
+
+### Worked example: the Facility Support Analyzer
+
+[`dspy-gepa-facility-support-task-spec.json`](dspy-gepa-facility-support-task-spec.json)
+is the tutorial's program: three `ChainOfThought` predictors over one
+`message`, with urgency (`low`, `medium`, `high`), sentiment (`positive`,
+`neutral`, `negative`), and a set of ten service categories. A sample row
+carries the input, one gold value per predictor, and a split:
+
+```json
+{"message": "<customer message>", "urgency": "high", "sentiment": "negative",
+ "categories": {"emergency_repair_services": true, "general_inquiries": false},
+ "split": "train"}
+```
+
+```bash
+understudy optimize-workload adapter run --adapter dspy-gepa --execute \
+  --repo . --samples samples.json \
+  --task-spec docs/dspy-gepa-facility-support-task-spec.json \
+  --model <student> --reflection-model <stronger-model> \
+  --reflection-minibatch-size 3 --reflection-temperature 1.0 --num-threads 8 \
+  --max-metric-calls 900 --component-selector round_robin \
+  --budget-usd 5 --input-usd-per-million <in> --output-usd-per-million <out> \
+  --reflection-input-usd-per-million <in> --reflection-output-usd-per-million <out> \
+  --evaluate-holdout --progress
+```
+
+Add `--frontier-type hybrid` to keep per-predictor winners on the Pareto front
+as well as per-row winners. Read `holdout-evaluation.json` `by_predictor` before
+quoting a total: in the standalone reproduction of this tutorial the test score
+went from 72% to 86-88% across three replicates, and the predictors do not move
+together.
 
 ## Watching a run
 
@@ -257,7 +368,6 @@ what they cost; it does not rank them on other tasks.
 | `dspy.Flex` (GEPA rewrites module structure) | Experimental; the adapter optimizes instruction text |
 | `ReActV2`, RLM sub-agents, `LocalInterpreter` | Agent features, not prompt optimization for a labeled task |
 | Jev / `TypeSafe` / `ReAnchor` | Need a vendor key; experimental decision types |
-| Objective frontiers (`objective_scores`), per-predictor feedback, typed `Literal` outputs | Not yet: the built-in metric is a single exact-match score over one signature. Planned with multi-predictor programs |
 | `max_reflection_cost` | `dspy.GEPA` raises on it; the spend ledger is the budget control |
 | Async LM calls | The metering engine has no async counterpart, so an async call fails instead of running unmetered |
 

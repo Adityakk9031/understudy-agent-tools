@@ -32,6 +32,23 @@ uses semantic-ish versioning (minor = new skill or new capability, patch = fixes
 
 ### Added
 
+- **`dspy-gepa` multi-predictor task specs.** `--task-spec PATH`
+  (`understudy.dspy_gepa_task_spec.v1`) declares several typed predictors over
+  shared inputs, the shape of DSPy's GEPA Facility Support Analyzer tutorial,
+  without user Python: `label` outputs become `Literal[...]`, `label-set`
+  outputs `list[Literal[...]]`, and `text` stays a matched string. Gold values
+  are checked against the spec before any provider call (a label set may be a
+  label list or the tutorial's `{label: bool}` object; errors name the row
+  index, never its content). The metric averages per-predictor scores, returns
+  them as `objective_scores`, and routes tutorial-style feedback to the
+  predictor GEPA is rewriting. New `--frontier-type
+  instance|objective|hybrid|cartesian` (objective modes need a spec);
+  `--component-selector` and the frontier are recorded in `search` and the
+  config hash, as is the spec's content. Candidates and holdout evaluations
+  report instructions and scores per predictor, and `--seed-instructions`
+  accepts spec names. The Facility Support spec ships as
+  `docs/dspy-gepa-facility-support-task-spec.json`; see
+  `docs/dspy-gepa-hill-climbing.md`.
 - **`dspy-gepa` streams and can climb.** Runs now stream
   `dspy-gepa/events.jsonl`, a live `run-state.json` (`status: running` plus the
   current `phase`), and `best-so-far.json` instead of writing everything at the
