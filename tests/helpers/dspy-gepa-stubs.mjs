@@ -115,9 +115,10 @@ export function writeScoreWithFeedbackStub(dspyRoot, gepaInit = "") {
   writeFileSync(join(gepaRoot, "__init__.py"), gepaInit, "utf8");
   writeFileSync(join(gepaRoot, "gepa_utils.py"), `
 class ScoreWithFeedback:
-    def __init__(self, score, feedback):
+    def __init__(self, score, feedback, objective_scores=None):
         self.score = score
         self.feedback = feedback
+        self.objective_scores = objective_scores
 `, "utf8");
 }
 
@@ -241,6 +242,156 @@ class GEPA:
             val_aggregate_scores=[0.75, 0.75] if already_evolved else [0.25, 0.75],
             total_metric_calls=2,
             num_full_val_evals=2,
+        )
+        return evolved
+`, "utf8");
+}
+
+// A multi-predictor DSPy for task-spec runs: dict signatures with typed fields,
+// dspy.Module attribute discovery ("name" for Predict, "name.predict" for
+// ChainOfThought, as DSPy 3.4.1 names them), and a GEPA that calls the metric the
+// way DSPy does (pred_name=None to score, then once per predictor for feedback).
+// Seed predictors answer STUB_ANSWERS[output][0]; evolved ones answer [1].
+export function writeTaskSpecDspyStubs(stubRoot) {
+  const dspyRoot = join(stubRoot, "dspy");
+  mkdirSync(dspyRoot, { recursive: true });
+  writePythonDistributionMetadata(stubRoot);
+  writeGepaPackageStubs(stubRoot);
+  writeScoreWithFeedbackStub(dspyRoot);
+  writeDspyClientsEngineStub(dspyRoot, `
+        with open(os.environ["PROVIDER_SENTINEL"], "a", encoding="utf-8") as handle:
+            handle.write("called\\n")
+        return SimpleNamespace(usage=SimpleNamespace(input_tokens=10, output_tokens=5))`);
+  writeFileSync(join(dspyRoot, "__init__.py"), `
+import copy
+import json
+import os
+from types import SimpleNamespace
+
+configured_lm = None
+
+def configure(lm):
+    global configured_lm
+    configured_lm = lm
+
+def _record_lm(lm):
+    pass
+${dspyLmStubSource}
+class _Field:
+    def __init__(self, kind):
+        self.kind = kind
+
+def InputField():
+    return _Field("input")
+
+def OutputField():
+    return _Field("output")
+
+class Signature:
+    def __init__(self, fields, instructions=None):
+        self.fields = dict(fields)
+        self.instructions = instructions or "default instruction"
+    def output_field(self):
+        return [name for name, (_, field) in self.fields.items() if field.kind == "output"][0]
+
+class Prediction(SimpleNamespace):
+    pass
+
+class Example:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+        self._inputs = []
+    def with_inputs(self, *keys):
+        self._inputs = list(keys)
+        return self
+    def inputs(self):
+        return {key: getattr(self, key) for key in self._inputs}
+
+def _answers():
+    return json.loads(os.environ.get("STUB_ANSWERS", "{}"))
+
+class Predict:
+    def __init__(self, signature):
+        self.signature = signature
+    def __call__(self, **kwargs):
+        configured_lm(prompt=str(sorted(kwargs)))
+        output = self.signature.output_field()
+        pair = _answers().get(output, ["seed", "evolved"])
+        return Prediction(**{output: pair[1] if "evolved" in self.signature.instructions else pair[0]})
+
+class ChainOfThought:
+    def __init__(self, signature):
+        self.predict = Predict(signature)
+    def __call__(self, **kwargs):
+        return self.predict(**kwargs)
+
+class Module:
+    def __init__(self):
+        self.callbacks = []
+        self.history = []
+    def named_predictors(self):
+        found = []
+        for name, value in vars(self).items():
+            if isinstance(value, Predict):
+                found.append((name, value))
+            elif isinstance(value, ChainOfThought):
+                found.append((name + ".predict", value.predict))
+        return found
+    def __call__(self, **kwargs):
+        return self.forward(**kwargs)
+    def dump_state(self, json_mode=False):
+        return {name: {"instructions": predictor.signature.instructions} for name, predictor in self.named_predictors()}
+
+def _plain(value):
+    if isinstance(value, dict):
+        return {key: _plain(item) for key, item in value.items()}
+    return value
+
+class GEPA:
+    def __init__(self, metric=None, reflection_lm=None, **kwargs):
+        self.metric = metric
+        self.reflection_lm = reflection_lm
+        self.kwargs = kwargs
+    def compile(self, student, trainset=None, valset=None):
+        copy.deepcopy(self.reflection_lm)(prompt="reflection")
+        example = valset[0]
+        prediction = student(**example.inputs())
+        scored = self.metric(example, prediction, None, None, None)
+        calls = [{"pred_name": None, "score": scored.score, "objective_scores": scored.objective_scores}]
+        names = [name for name, _ in student.named_predictors()]
+        for name in names:
+            result = self.metric(example, prediction, None, name, None)
+            calls.append({"pred_name": name, "score": result.score, "feedback": result.feedback})
+        evolve = [item for item in os.environ.get("STUB_EVOLVE", ",".join(names)).split(",") if item]
+        candidate = {
+            name: ("evolved instruction" if name in evolve else predictor.signature.instructions)
+            for name, predictor in student.named_predictors()
+        }
+        inner = self.kwargs.get("gepa_kwargs") or {}
+        for callback in inner.get("callbacks") or []:
+            callback.on_valset_evaluated({
+                "iteration": 1, "candidate_idx": 1, "candidate": candidate, "average_score": 1.0,
+                "num_examples_evaluated": len(valset), "total_valset_size": len(valset), "is_best_program": True,
+            })
+        with open(os.environ["GEPA_KWARGS_PATH"], "w", encoding="utf-8") as handle:
+            json.dump({
+                "metric_calls": calls,
+                "predictor_names": names,
+                "seed_instructions": {name: predictor.signature.instructions for name, predictor in student.named_predictors()},
+                "field_types": {
+                    name: {field: str(annotation) for field, (annotation, _) in predictor.signature.fields.items()}
+                    for name, predictor in student.named_predictors()
+                },
+                "component_selector": self.kwargs.get("component_selector"),
+                "frontier_type": inner.get("frontier_type"),
+                "trainset": len(trainset),
+                "valset": len(valset),
+            }, handle, default=str)
+        evolved = copy.deepcopy(student)
+        for name, predictor in evolved.named_predictors():
+            predictor.signature.instructions = candidate[name]
+        evolved.detailed_results = SimpleNamespace(
+            val_aggregate_scores=[float(scored.score), 1.0], total_metric_calls=len(calls), num_full_val_evals=2,
         )
         return evolved
 `, "utf8");

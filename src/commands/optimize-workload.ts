@@ -62,7 +62,7 @@ export function registerOptimizeWorkloadCommand(program: Command): void {
     .option("--output-keys <keys>", "Comma-separated DSPy output keys")
     .option("--model <name>", "Optional deployment/model name")
     .option("--reflection-model <name>", "Required separate DSPy reflection deployment/model")
-    .option("--module <name>", "predict or cot", "predict")
+    .option("--module <name>", "predict or cot (default predict, or the task spec's module)")
     .option("--max-metric-calls <number>", "GEPA metric-call budget")
     .option("--split-key <field>", "Sample split field", "split")
     .option("--train-split <value>", "Train split value", "train")
@@ -84,7 +84,8 @@ export function registerOptimizeWorkloadCommand(program: Command): void {
     .option("--score-objective <name>", "exact_match, tool_call, or mixed", "exact_match")
     .option("--reflection-minibatch-size <number>", "GEPA reflection minibatch size", "1")
     .option("--candidate-selection-strategy <name>", "pareto or current_best", "pareto")
-    .option("--component-selector <name>", "round_robin or all", "round_robin")
+    .option("--component-selector <name>", "Which predictors GEPA updates per iteration: round_robin or all", "round_robin")
+    .option("--frontier-type <name>", "GEPA Pareto frontier: instance (default), or objective, hybrid, cartesian (need --task-spec)")
     .option("--use-merge", "Enable GEPA candidate merging")
     .option("--max-merge-invocations <number>", "Maximum GEPA merge invocations", "5")
     .option("--num-threads <number>", "GEPA worker threads", "1")
@@ -99,6 +100,7 @@ export function registerOptimizeWorkloadCommand(program: Command): void {
     .option("--evaluate-holdout", "After the candidate is frozen, score baseline and optimized once on holdout rows (extra metered calls)")
     .option("--match-mode <mode>", "exact (default) or case-insensitive label comparison; holdout results report both")
     .option("--seed-instructions <path>", "Warm start from best-so-far.json, candidate.json, a {predictor: text} file, or text")
+    .option("--task-spec <path>", "Multi-predictor task spec JSON (understudy.dspy_gepa_task_spec.v1); replaces --input-keys/--output-keys")
     .option("--rounds <number>", "Climb rounds; each restarts GEPA from the previous round's best prompt (default 1)")
     .option("--min-round-gain <number>", "Stop climbing when a round gains no more than this on the dev split (default 0)")
     .option("--stop-after-stale <number>", "Stop a round after this many iterations without a new best dev score")
@@ -157,6 +159,8 @@ export function registerOptimizeWorkloadCommand(program: Command): void {
         evaluateHoldout?: boolean;
         matchMode?: string;
         seedInstructions?: string;
+        taskSpec?: string;
+        frontierType?: string;
         rounds?: string;
         minRoundGain?: string;
         stopAfterStale?: string;

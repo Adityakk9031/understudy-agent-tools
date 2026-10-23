@@ -1139,6 +1139,8 @@ def holdout_rows_for(rows: list[dict[str, Any]], split_key: str) -> list[dict[st
 
 
 MATCH_MODES = ("exact", "case-insensitive")
+# GEPA 0.1.4 Pareto frontiers; all but instance need objective_scores from the metric.
+FRONTIER_TYPES = ("instance", "objective", "hybrid", "cartesian")
 
 
 def normalize_label(value: Any, match_mode: str) -> str:
@@ -1166,6 +1168,413 @@ def exact_match_feedback(output_keys: list[str], gold: Any, pred: Any, match_mod
     score = sum(1.0 for item in matches if item) / len(matches) if matches else 0.0
     feedback = "All output fields matched." if not gaps else "Output mismatches: " + "; ".join(gaps)
     return ScoreWithFeedback(score=score, feedback=feedback)
+
+
+# A declarative multi-predictor program: one typed DSPy predictor per spec entry,
+# scored per predictor, with the mean as the GEPA score. See
+# docs/dspy-gepa-hill-climbing.md "Multi-predictor task specs".
+TASK_SPEC_SCHEMA_VERSION = "understudy.dspy_gepa_task_spec.v1"
+TASK_SPEC_KINDS = ("label", "label-set", "text")
+TASK_SPEC_MODULES = ("predict", "cot")
+TASK_SPEC_PREDICTOR_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+TASK_SPEC_FIELD_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+# dspy.Module members a predictor attribute must not shadow (rechecked against the
+# installed dspy when the program is built), and the field ChainOfThought adds.
+TASK_SPEC_RESERVED_NAMES = frozenset({
+    "batch", "callbacks", "deepcopy", "dump_state", "forward", "get_lm", "history",
+    "inspect_history", "load", "load_state", "map_named_predictors", "named_parameters",
+    "named_predictors", "named_sub_modules", "parameters", "predictors", "reset_copy",
+    "save", "set_lm",
+})
+TASK_SPEC_RESERVED_FIELDS = frozenset({"reasoning"})
+TASK_SPEC_MAX_PREDICTORS = 32
+TASK_SPEC_MAX_LABELS = 256
+TASK_SPEC_MAX_INSTRUCTIONS = 20000
+# Feedback quotes labels in backticks, as the DSPy tutorial does; chr() keeps the
+# character out of this TypeScript template literal.
+BACKTICK = chr(96)
+
+
+class TaskSpecError(ValueError):
+    """An invalid task spec or gold value. Messages carry spec paths, predictor
+    names and row indexes only, never row content, so they are safe to report."""
+
+
+def validate_task_spec(raw: Any) -> dict[str, Any]:
+    """Validate a parsed understudy.dspy_gepa_task_spec.v1 object and normalize it."""
+
+    def bad(path: str, problem: str) -> TaskSpecError:
+        return TaskSpecError(f"task-spec-invalid: {path} {problem}")
+
+    if not isinstance(raw, dict):
+        raise bad("spec", "must be a JSON object")
+    unknown = sorted(set(raw) - {"schema_version", "description", "inputs", "module", "predictors"})
+    if unknown:
+        raise bad("spec", f"has unknown keys {unknown}")
+    if raw.get("schema_version") != TASK_SPEC_SCHEMA_VERSION:
+        raise bad("schema_version", f"must be {TASK_SPEC_SCHEMA_VERSION}")
+    if "description" in raw and not isinstance(raw["description"], str):
+        raise bad("description", "must be a string")
+    inputs = raw.get("inputs")
+    if (
+        not isinstance(inputs, list)
+        or not inputs
+        or not all(isinstance(key, str) and TASK_SPEC_FIELD_NAME.match(key) for key in inputs)
+        or len(set(inputs)) != len(inputs)
+    ):
+        raise bad("inputs", "must be a non-empty list of unique field names")
+    if TASK_SPEC_RESERVED_FIELDS & set(inputs):
+        raise bad("inputs", "must not use a reserved field name")
+    module = raw.get("module", "predict")
+    if module not in TASK_SPEC_MODULES:
+        raise bad("module", "must be predict or cot")
+    predictors = raw.get("predictors")
+    if not isinstance(predictors, list) or not predictors or len(predictors) > TASK_SPEC_MAX_PREDICTORS:
+        raise bad("predictors", f"must be a list of 1 to {TASK_SPEC_MAX_PREDICTORS} predictors")
+    names: set[str] = set()
+    outputs: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for index, entry in enumerate(predictors):
+        path = f"predictors[{index}]"
+        if not isinstance(entry, dict):
+            raise bad(path, "must be an object")
+        unknown = sorted(set(entry) - {"name", "output", "instructions", "type"})
+        if unknown:
+            raise bad(path, f"has unknown keys {unknown}")
+        name = entry.get("name")
+        if not isinstance(name, str) or not TASK_SPEC_PREDICTOR_NAME.match(name):
+            raise bad(f"{path}.name", "must match ^[a-z][a-z0-9_]{0,63}$")
+        if name in TASK_SPEC_RESERVED_NAMES or name.startswith("_"):
+            raise bad(f"{path}.name", "is reserved by dspy.Module")
+        if name in names:
+            raise bad(f"{path}.name", "repeats another predictor's name")
+        names.add(name)
+        output = entry.get("output", name)
+        if not isinstance(output, str) or not TASK_SPEC_FIELD_NAME.match(output):
+            raise bad(f"{path}.output", "must be a field name")
+        if output in TASK_SPEC_RESERVED_FIELDS or output in inputs:
+            raise bad(f"{path}.output", "must not be reserved or an input")
+        if output in outputs:
+            raise bad(f"{path}.output", "repeats another predictor's output")
+        outputs.add(output)
+        instructions = entry.get("instructions")
+        if instructions is not None and (
+            not isinstance(instructions, str)
+            or not instructions.strip()
+            or len(instructions) > TASK_SPEC_MAX_INSTRUCTIONS
+        ):
+            raise bad(f"{path}.instructions", f"must be non-empty text of at most {TASK_SPEC_MAX_INSTRUCTIONS} characters")
+        field_type = entry.get("type")
+        if not isinstance(field_type, dict) or field_type.get("kind") not in TASK_SPEC_KINDS:
+            raise bad(f"{path}.type.kind", "must be label, label-set, or text")
+        kind = field_type["kind"]
+        unknown = sorted(set(field_type) - {"kind", "labels"})
+        if unknown:
+            raise bad(f"{path}.type", f"has unknown keys {unknown}")
+        normalized_type: dict[str, Any] = {"kind": kind}
+        if kind == "text":
+            if "labels" in field_type:
+                raise bad(f"{path}.type.labels", "is not allowed for text")
+        else:
+            labels = field_type.get("labels")
+            if (
+                not isinstance(labels, list)
+                or not labels
+                or len(labels) > TASK_SPEC_MAX_LABELS
+                or not all(isinstance(label, str) and label.strip() == label and label for label in labels)
+                or len(set(labels)) != len(labels)
+            ):
+                raise bad(
+                    f"{path}.type.labels",
+                    f"must be 1 to {TASK_SPEC_MAX_LABELS} unique non-empty strings without surrounding whitespace",
+                )
+            if len({normalize_label(label, "case-insensitive") for label in labels}) != len(labels):
+                raise bad(f"{path}.type.labels", "must stay unique when letter case is ignored")
+            normalized_type["labels"] = list(labels)
+        normalized.append({
+            "name": name,
+            "output": output,
+            "instructions": instructions,
+            "type": normalized_type,
+        })
+    return {
+        "schema_version": TASK_SPEC_SCHEMA_VERSION,
+        "inputs": list(inputs),
+        "module": module,
+        "predictors": normalized,
+    }
+
+
+def load_task_spec(path: Path) -> dict[str, Any]:
+    if not path.is_file() or path.is_symlink():
+        raise TaskSpecError("task-spec-invalid: --task-spec must be a non-symlink regular file")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise TaskSpecError("task-spec-invalid: --task-spec must contain valid JSON") from None
+    return validate_task_spec(raw)
+
+
+def task_spec_gold(predictor: Mapping[str, Any], value: Any) -> Any:
+    """Normalize one gold value: a label string, a label list in spec order, or text.
+
+    A label-set accepts a list of labels or a {label: bool} object (the DSPy
+    tutorial's format; absent labels are false). Raises ValueError with a reason
+    that never quotes the value.
+    """
+    kind = predictor["type"]["kind"]
+    if kind == "text":
+        if not isinstance(value, str):
+            raise ValueError("expected a string")
+        return value
+    labels = predictor["type"]["labels"]
+    if kind == "label":
+        if not isinstance(value, str):
+            raise ValueError("expected a string label")
+        if value not in labels:
+            raise ValueError("label is not in the spec's label set")
+        return value
+    if isinstance(value, dict):
+        if not all(isinstance(flag, bool) for flag in value.values()):
+            raise ValueError("label-set object values must be true or false")
+        chosen = [label for label, flag in value.items() if flag]
+        named = list(value)
+    elif isinstance(value, list):
+        if not all(isinstance(label, str) for label in value):
+            raise ValueError("label-set list must contain strings")
+        if len(set(value)) != len(value):
+            raise ValueError("label-set list repeats a label")
+        chosen = named = list(value)
+    else:
+        raise ValueError("expected a list of labels or a {label: bool} object")
+    if any(label not in labels for label in named):
+        raise ValueError("label is not in the spec's label set")
+    chosen_set = set(chosen)
+    return [label for label in labels if label in chosen_set]
+
+
+def validate_task_spec_rows(spec: Mapping[str, Any], rows: list[Any], used: list[Any]) -> None:
+    """Check every used row against the spec before any provider call.
+
+    Errors name the row's index in the samples file and the predictor, never content.
+    """
+    used_ids = {id(row) for row in used}
+    for index, row in enumerate(rows):
+        if id(row) not in used_ids:
+            continue
+        if not isinstance(row, dict):
+            raise TaskSpecError(f"task-spec-row-invalid: sample row {index} is not an object")
+        for key in spec["inputs"]:
+            if key not in row:
+                raise TaskSpecError(f"task-spec-row-invalid: sample row {index} is missing input {key}")
+        for predictor in spec["predictors"]:
+            output = predictor["output"]
+            if output not in row:
+                raise TaskSpecError(
+                    f"task-spec-gold-invalid: sample row {index} has no gold {output} for predictor {predictor['name']}"
+                )
+            try:
+                task_spec_gold(predictor, row[output])
+            except ValueError as error:
+                raise TaskSpecError(
+                    f"task-spec-gold-invalid: sample row {index}, predictor {predictor['name']}: {error}"
+                ) from None
+
+
+def task_spec_output_type(predictor: Mapping[str, Any]) -> Any:
+    """label -> Literal[...], label-set -> list[Literal[...]], text -> str."""
+    from typing import Literal
+
+    kind = predictor["type"]["kind"]
+    if kind == "text":
+        return str
+    literal = Literal[tuple(predictor["type"]["labels"])]  # type: ignore[valid-type]
+    return list[literal] if kind == "label-set" else literal  # type: ignore[valid-type]
+
+
+def task_spec_signature(dspy: Any, spec: Mapping[str, Any], predictor: Mapping[str, Any]) -> Any:
+    fields: dict[str, Any] = {key: (str, dspy.InputField()) for key in spec["inputs"]}
+    fields[predictor["output"]] = (task_spec_output_type(predictor), dspy.OutputField())
+    if predictor.get("instructions"):
+        return dspy.Signature(fields, predictor["instructions"])
+    return dspy.Signature(fields)
+
+
+def build_task_spec_program(dspy: Any, spec: Mapping[str, Any]) -> Any:
+    """One dspy.Predict or dspy.ChainOfThought per predictor, as attributes named
+    after the predictors, so DSPy names them "<name>" or "<name>.predict"."""
+    module_type = dspy.ChainOfThought if spec["module"] == "cot" else dspy.Predict
+    predictors = [dict(predictor) for predictor in spec["predictors"]]
+    input_keys = list(spec["inputs"])
+
+    class TaskSpecProgram(dspy.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            for predictor in predictors:
+                if hasattr(self, predictor["name"]):
+                    raise TaskSpecError(f"task-spec-invalid: predictor name {predictor['name']} is reserved by dspy.Module")
+                setattr(self, predictor["name"], module_type(task_spec_signature(dspy, spec, predictor)))
+
+        def forward(self, **inputs: Any) -> Any:
+            values = {key: inputs[key] for key in input_keys}
+            outputs = {}
+            for predictor in predictors:
+                result = getattr(self, predictor["name"])(**values)
+                outputs[predictor["output"]] = getattr(result, predictor["output"], None)
+            return dspy.Prediction(**outputs)
+
+    return TaskSpecProgram()
+
+
+def task_spec_predictor_routing(program: Any, spec: Mapping[str, Any]) -> dict[str, str]:
+    """Map each DSPy predictor name (what GEPA passes as pred_name) to its spec name."""
+    names = [predictor["name"] for predictor in spec["predictors"]]
+    routing: dict[str, str] = {}
+    for dspy_name, _ in program.named_predictors():
+        head = str(dspy_name).split(".", 1)[0]
+        if head not in names or head in routing.values():
+            raise TaskSpecError("task-spec-invalid: unexpected DSPy predictor layout")
+        routing[str(dspy_name)] = head
+    if sorted(routing.values()) != sorted(names):
+        raise TaskSpecError("task-spec-invalid: unexpected DSPy predictor layout")
+    return routing
+
+
+def task_spec_subject(spec: Mapping[str, Any]) -> str:
+    return spec["inputs"][0] if len(spec["inputs"]) == 1 else "input"
+
+
+def quoted(value: Any) -> str:
+    return f"{BACKTICK}{value}{BACKTICK}"
+
+
+def task_spec_component(
+    predictor: Mapping[str, Any],
+    gold: Any,
+    predicted: Any,
+    match_mode: str,
+    subject: str,
+) -> tuple[float, str]:
+    """Score one predictor's output and explain it in the DSPy tutorial's style."""
+    output = predictor["output"]
+    kind = predictor["type"]["kind"]
+    if kind == "label-set":
+        labels = predictor["type"]["labels"]
+        def norm(value: Any) -> str:
+            return normalize_label(value, match_mode)
+        if isinstance(predicted, (list, tuple, set)):
+            values = list(predicted)
+        else:
+            values = [] if predicted is None or predicted == "" else [predicted]
+        predicted_set = {norm(value) for value in values}
+        gold_set = {norm(label) for label in gold or []}
+        known = {norm(label) for label in labels}
+        hit = [label for label in labels if norm(label) in gold_set and norm(label) in predicted_set]
+        wrong = [label for label in labels if norm(label) not in gold_set and norm(label) in predicted_set]
+        missed = [label for label in labels if norm(label) in gold_set and norm(label) not in predicted_set]
+        outside = sorted(str(value).strip() for value in values if norm(value) not in known)
+        # Per-label agreement over the spec's label set, as the tutorial scores it.
+        score = (len(labels) - len(wrong) - len(missed)) / len(labels)
+        if score == 1.0 and not outside:
+            return score, (
+                f"The {output} classification is perfect. You correctly identified that the {subject} "
+                f"falls under the following {output}: {quoted(repr(hit))}."
+            )
+        text = (
+            f"The {output} classification is not perfect. You correctly identified that the {subject} "
+            f"falls under the following {output}: {quoted(repr(hit))}.\n"
+        )
+        if wrong:
+            text += (
+                f"However, you incorrectly identified that the {subject} falls under the following "
+                f"{output}: {quoted(repr(wrong))}. The {subject} DOES NOT fall under these {output}.\n"
+            )
+        if missed:
+            lead = "Additionally, you" if wrong else "However, you"
+            text += (
+                f"{lead} didn't identify the following {output} that the {subject} actually falls "
+                f"under: {quoted(repr(missed))}.\n"
+            )
+        if outside:
+            text += f"These values are not valid {output} labels: {quoted(repr(outside))}.\n"
+        text += f"Think about how you could have reasoned to get the correct {output} labels."
+        return score, text
+    expected = str(gold)
+    actual = "" if predicted is None else str(predicted).strip()
+    if normalize_label(actual, match_mode) == normalize_label(expected, match_mode):
+        if kind == "label":
+            return 1.0, (
+                f"You correctly classified the {output} of the {subject} as {quoted(expected)}. "
+                f"This {subject} is indeed of {quoted(expected)} {output}."
+            )
+        return 1.0, f"Your {output} matches the expected {output}."
+    hint = " It differs only in letter case." if actual.casefold() == expected.casefold() else ""
+    if kind == "label":
+        return 0.0, (
+            f"You incorrectly classified the {output} of the {subject} as {quoted(actual)}. "
+            f"The correct {output} is {quoted(expected)}.{hint} "
+            f"Think about how you could have reasoned to get the correct {output} label."
+        )
+    return 0.0, (
+        f"Your {output} was {quoted(actual)}, but the expected {output} is {quoted(expected)}.{hint}"
+    )
+
+
+def task_spec_components(
+    spec: Mapping[str, Any], gold: Any, prediction: Any, match_mode: str,
+) -> dict[str, tuple[float, str]]:
+    subject = task_spec_subject(spec)
+    return {
+        predictor["name"]: task_spec_component(
+            predictor,
+            getattr(gold, predictor["output"], None),
+            getattr(prediction, predictor["output"], None),
+            match_mode,
+            subject,
+        )
+        for predictor in spec["predictors"]
+    }
+
+
+def task_spec_feedback(
+    spec: Mapping[str, Any],
+    routing: Mapping[str, str],
+    gold: Any,
+    prediction: Any,
+    match_mode: str,
+    pred_name: str | None = None,
+) -> Any:
+    """GEPA metric result: the mean of the predictor scores, per-predictor
+    objective_scores, and feedback for the predictor GEPA is updating.
+
+    At pred_name=None (plain scoring) the feedback covers every predictor.
+    """
+    from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback
+
+    parts = task_spec_components(spec, gold, prediction, match_mode)
+    total = sum(score for score, _ in parts.values()) / len(parts)
+    objective_scores = {name: score for name, (score, _) in parts.items()}
+    target = None
+    if pred_name is not None:
+        target = routing.get(pred_name) or str(pred_name).split(".", 1)[0]
+    if target in parts:
+        feedback = parts[target][1]
+    else:
+        feedback = "\n".join(f"{name}: {text}" for name, (_, text) in parts.items())
+    return ScoreWithFeedback(score=total, feedback=feedback, objective_scores=objective_scores)
+
+
+def task_spec_predicted(spec: Mapping[str, Any], prediction: Any) -> dict[str, Any]:
+    """JSON-safe predicted outputs for the holdout artifact."""
+    predicted: dict[str, Any] = {}
+    for predictor in spec["predictors"]:
+        value = getattr(prediction, predictor["output"], None)
+        if predictor["type"]["kind"] == "label-set":
+            values = value if isinstance(value, (list, tuple, set)) else ([] if value is None else [value])
+            predicted[predictor["output"]] = sorted(str(item).strip() for item in values)
+        else:
+            predicted[predictor["output"]] = "" if value is None else str(value).strip()
+    return predicted
 
 
 def dspy_run_dir(args: argparse.Namespace) -> Path:
@@ -2145,8 +2554,16 @@ def load_seed_instructions(path: Path) -> dict[str, str]:
     raise ValueError(f"{path.name} does not contain instructions to seed from")
 
 
-def apply_instructions(program: Any, instructions: Mapping[str, str]) -> None:
+def apply_instructions(
+    program: Any,
+    instructions: Mapping[str, str],
+    aliases: Mapping[str, str] | None = None,
+) -> None:
+    """Set predictor instructions keyed by DSPy predictor name, a task-spec
+    predictor name (via aliases), or "*" for every predictor."""
     named = dict(program.named_predictors())
+    aliases = aliases or {}
+    instructions = {aliases.get(key, key): text for key, text in instructions.items()}
     unknown = sorted(set(instructions) - set(named) - {"*"})
     if unknown:
         raise ValueError(f"seed instructions name unknown predictors {unknown}; this program has {sorted(named)}")
@@ -2211,6 +2628,25 @@ def validate_search_options(args: argparse.Namespace) -> None:
         seed = Path(args.seed_instructions)
         if not seed.is_file() or seed.is_symlink():
             raise ValueError("--seed-instructions file does not exist")
+    if args.frontier_type not in FRONTIER_TYPES:
+        raise ValueError("--frontier-type must be instance, objective, hybrid, or cartesian")
+    args.task_spec_data = None
+    if args.task_spec:
+        if args.program_bridge:
+            raise ValueError("--task-spec is not supported with --program-bridge")
+        if split_keys(args.input_keys or "") or split_keys(args.output_keys or ""):
+            raise ValueError("--task-spec defines the input and output keys; drop --input-keys and --output-keys")
+        args.task_spec_data = load_task_spec(Path(args.task_spec))
+        if args.module is not None and args.module != args.task_spec_data["module"]:
+            raise TaskSpecError("task-spec-invalid: --module differs from the spec's module")
+        args.module = args.task_spec_data["module"]
+        args.input_keys = ",".join(args.task_spec_data["inputs"])
+        args.output_keys = ",".join(predictor["output"] for predictor in args.task_spec_data["predictors"])
+    elif args.frontier_type != "instance":
+        # Objective frontiers need per-objective scores, which only spec metrics return.
+        raise ValueError("--frontier-type objective, hybrid, and cartesian need --task-spec")
+    if args.module is None:
+        args.module = "predict"
     if args.program_bridge:
         # A bridge owns its seed program, metric and holdout. These flags act on
         # the built-in signature scaffold only.
@@ -2250,6 +2686,8 @@ def search_settings(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
             else None
         ),
         "match_mode": args.match_mode,
+        "component_selector": args.component_selector,
+        "frontier_type": args.frontier_type,
         "stop_file": artifact_path(repo, dspy_stop_file_path(args)),
     }
 
@@ -2283,6 +2721,9 @@ def build_gepa_search_kwargs(
         "callbacks": [GepaProgress(events, best_path, round_index)],
         "stop_callbacks": stoppers,
     }
+    if args.frontier_type != "instance":
+        # GEPA's own default is instance; other frontiers read the metric's objective_scores.
+        inner["frontier_type"] = args.frontier_type
     proposals = int(args.proposals_per_iteration)
     if proposals > 1:
         from gepa.strategies.proposal_sampling import IndependentSampling
@@ -2348,12 +2789,15 @@ def score_program_on_rows(
     threads: int,
     on_progress: Callable[[int, int, float], None] | None = None,
     match_mode: str = "exact",
+    task_spec: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Score a program on rows; spend errors abort, others count as failures.
 
     The score follows match_mode, and both exact and case-insensitive scores are
-    always reported so a casing-only gain cannot pass for task skill.
+    always reported so a casing-only gain cannot pass for task skill. A task spec
+    scores each predictor and reports them under by_predictor.
     """
+    predictor_names = [predictor["name"] for predictor in task_spec["predictors"]] if task_spec else []
     progress_lock = threading.Lock()
     finished = {"done": 0, "score": 0.0}
 
@@ -2382,29 +2826,62 @@ def score_program_on_rows(
                 "predicted": None,
                 "score": 0.0,
                 "by_match": {mode: 0.0 for mode in MATCH_MODES},
+                "by_predictor": {mode: {name: 0.0 for name in predictor_names} for mode in MATCH_MODES},
                 "error": type(error).__name__,
             }
-        predicted = {key: str(getattr(prediction, key, "")).strip() for key in output_keys}
-        by_match = {
-            mode: float(exact_match_feedback(output_keys, gold, prediction, mode).score)
-            for mode in MATCH_MODES
-        }
+        if task_spec is not None:
+            predicted = task_spec_predicted(task_spec, prediction)
+            by_predictor = {
+                mode: {
+                    name: part[0]
+                    for name, part in task_spec_components(task_spec, gold, prediction, mode).items()
+                }
+                for mode in MATCH_MODES
+            }
+            by_match = {
+                mode: sum(by_predictor[mode].values()) / len(predictor_names) for mode in MATCH_MODES
+            }
+        else:
+            predicted = {key: str(getattr(prediction, key, "")).strip() for key in output_keys}
+            by_predictor = {mode: {} for mode in MATCH_MODES}
+            by_match = {
+                mode: float(exact_match_feedback(output_keys, gold, prediction, mode).score)
+                for mode in MATCH_MODES
+            }
         score = by_match[match_mode]
         record(score)
-        return {"predicted": predicted, "score": score, "by_match": by_match, "error": None}
+        return {
+            "predicted": predicted,
+            "score": score,
+            "by_match": by_match,
+            "by_predictor": by_predictor,
+            "error": None,
+        }
 
     with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
         results = list(pool.map(run, range(len(rows))))
     count = len(results)
-    return {
-        "score": sum(item["score"] for item in results) / count if count else 0.0,
-        "by_match": {
-            mode: (sum(item["by_match"][mode] for item in results) / count if count else 0.0)
-            for mode in MATCH_MODES
-        },
+
+    def mean(values: list[float]) -> float:
+        return sum(values) / len(values) if values else 0.0
+
+    summary: dict[str, Any] = {
+        "score": mean([item["score"] for item in results]),
+        "by_match": {mode: mean([item["by_match"][mode] for item in results]) for mode in MATCH_MODES},
         "errors": sum(1 for item in results if item["error"]),
         "rows": results,
     }
+    if task_spec is not None:
+        summary["by_predictor"] = {
+            name: {
+                "score": mean([item["by_predictor"][match_mode][name] for item in results]),
+                "by_match": {
+                    mode: mean([item["by_predictor"][mode][name] for item in results]) for mode in MATCH_MODES
+                },
+            }
+            for name in predictor_names
+        }
+    return summary
 
 
 def evaluate_holdout(
@@ -2418,6 +2895,7 @@ def evaluate_holdout(
     ledger: SpendLedger,
     events: RunEvents | None = None,
     match_mode: str = "exact",
+    task_spec: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Baseline vs optimized score on the holdout rows, after the candidate is frozen.
 
@@ -2436,6 +2914,10 @@ def evaluate_holdout(
         "delta": None,
         "rows": [],
     }
+    if task_spec is not None:
+        # Each predictor is scored on its own; the program score is their mean.
+        evaluation["aggregate"] = "mean-of-predictor-scores"
+        evaluation["predictors"] = [predictor["name"] for predictor in task_spec["predictors"]]
 
     def reporter(program_name: str) -> Callable[[int, int, float], None] | None:
         if events is None:
@@ -2448,24 +2930,24 @@ def evaluate_holdout(
             running_score=round(running_score, 4),
         )
 
+    def program_summary(result: Mapping[str, Any]) -> dict[str, Any]:
+        summary = {key: result[key] for key in ("score", "errors", "by_match")}
+        if "by_predictor" in result:
+            summary["by_predictor"] = result["by_predictor"]
+        return summary
+
     failure_before = ledger.failure
     try:
         baseline_result = score_program_on_rows(
             baseline, rows, input_keys, output_keys, to_example, threads, reporter("baseline"), match_mode,
+            task_spec,
         )
-        evaluation["baseline"] = {
-            "score": baseline_result["score"],
-            "errors": baseline_result["errors"],
-            "by_match": baseline_result["by_match"],
-        }
+        evaluation["baseline"] = program_summary(baseline_result)
         optimized_result = score_program_on_rows(
             optimized, rows, input_keys, output_keys, to_example, threads, reporter("optimized"), match_mode,
+            task_spec,
         )
-        evaluation["optimized"] = {
-            "score": optimized_result["score"],
-            "errors": optimized_result["errors"],
-            "by_match": optimized_result["by_match"],
-        }
+        evaluation["optimized"] = program_summary(optimized_result)
     except Exception as error:
         cause = spend_cause(error)
         if cause is None:
@@ -2483,10 +2965,25 @@ def evaluate_holdout(
         )
         return evaluation
     evaluation["delta"] = evaluation["optimized"]["score"] - evaluation["baseline"]["score"]
+    if task_spec is not None:
+        evaluation["delta_by_predictor"] = {
+            name: evaluation["optimized"]["by_predictor"][name]["score"]
+            - evaluation["baseline"]["by_predictor"][name]["score"]
+            for name in evaluation["predictors"]
+        }
+
+    def expected(row: Mapping[str, Any]) -> dict[str, Any]:
+        if task_spec is None:
+            return {key: str(row[key]).strip() for key in output_keys}
+        return {
+            predictor["output"]: task_spec_gold(predictor, row[predictor["output"]])
+            for predictor in task_spec["predictors"]
+        }
+
     # Expected labels and predictions only; inputs stay out of the artifact.
     evaluation["rows"] = [
         {
-            "expected": {key: str(row[key]).strip() for key in output_keys},
+            "expected": expected(row),
             "baseline": base["predicted"],
             "optimized": opt["predicted"],
             "baseline_score": base["score"],
@@ -2552,6 +3049,10 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
 
     import dspy
 
+    task_spec: dict[str, Any] | None = getattr(args, "task_spec_data", None)
+    # Samples load before any network access, so a task spec can reject a bad
+    # gold value before the gateway or a provider is contacted.
+    rows = load_rows(args.samples) if args.samples else []
     gateway_url = os.environ.get("UNDERSTUDY_GATEWAY_URL")
     student_route, student_api_key, student_api_base = resolve_lm_route(
         "student", args.model, bridge_config, gateway_url,
@@ -2589,7 +3090,6 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
             if ledger.prices_for(route["requested_model"], role) is None:
                 raise ValueError(f"no price basis for the {role} model")
 
-    rows = load_rows(args.samples) if args.samples else []
     input_keys = split_keys(args.input_keys or "")
     output_keys = split_keys(args.output_keys or "")
     bridge_module = load_program_bridge(program_bridge_path) if program_bridge_path else None
@@ -2615,8 +3115,10 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
             raise ValueError(f"--evaluate-holdout needs rows with {args.split_key}=holdout")
         for row in holdout_rows:
             missing = [key for key in [*input_keys, *output_keys] if key not in row]
-            if missing:
+            if missing and task_spec is None:
                 raise ValueError("holdout row is missing keys")
+    if task_spec is not None:
+        validate_task_spec_rows(task_spec, rows, [*train_rows, *dev_rows, *holdout_rows])
     events.emit("data-loaded", train=len(train_rows), dev=len(dev_rows), holdout=holdout_count)
 
     config_base = {
@@ -2642,6 +3144,16 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
         },
         "input_keys": input_keys,
         "output_keys": output_keys,
+        # The spec file is bound by content hash and by its normalized form.
+        "task_spec": (
+            {
+                "logical_path": logical_path(repo, Path(args.task_spec)),
+                "sha256": file_sha256(Path(args.task_spec).resolve()),
+                "spec": task_spec,
+            }
+            if task_spec is not None
+            else None
+        ),
         "split": {
             "key": args.split_key,
             "train": args.train_split,
@@ -2795,18 +3307,40 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
     exporter = None
     bridge_state = None
     baseline_feedback = None
+    routing: dict[str, str] = {}
     if bridge_module is None:
-        for row in [*train_rows, *dev_rows]:
-            missing = [key for key in [*input_keys, *output_keys] if key not in row]
-            if missing:
-                raise ValueError(f"sample row is missing keys: {', '.join(missing)}")
-        signature = dspy.Signature(f"{', '.join(input_keys)} -> {', '.join(output_keys)}")
-        student = dspy.ChainOfThought(signature) if args.module == "cot" else dspy.Predict(signature)
+        if task_spec is not None:
+            # Rows were checked against the spec above; gold values are normalized
+            # (a label-set becomes its label list in spec order).
+            student = build_task_spec_program(dspy, task_spec)
+            routing = task_spec_predictor_routing(student, task_spec)
 
-        def to_example(row: dict[str, Any]) -> Any:
-            return dspy.Example(
-                **{key: row[key] for key in [*input_keys, *output_keys]},
-            ).with_inputs(*input_keys)
+            def to_example(row: dict[str, Any]) -> Any:
+                gold = {
+                    predictor["output"]: task_spec_gold(predictor, row[predictor["output"]])
+                    for predictor in task_spec["predictors"]
+                }
+                return dspy.Example(
+                    **{key: row[key] for key in input_keys}, **gold,
+                ).with_inputs(*input_keys)
+
+            def score_with_feedback(gold: Any, pred: Any, pred_name: str | None = None) -> Any:
+                return task_spec_feedback(task_spec, routing, gold, pred, args.match_mode, pred_name)
+        else:
+            for row in [*train_rows, *dev_rows]:
+                missing = [key for key in [*input_keys, *output_keys] if key not in row]
+                if missing:
+                    raise ValueError(f"sample row is missing keys: {', '.join(missing)}")
+            signature = dspy.Signature(f"{', '.join(input_keys)} -> {', '.join(output_keys)}")
+            student = dspy.ChainOfThought(signature) if args.module == "cot" else dspy.Predict(signature)
+
+            def to_example(row: dict[str, Any]) -> Any:
+                return dspy.Example(
+                    **{key: row[key] for key in [*input_keys, *output_keys]},
+                ).with_inputs(*input_keys)
+
+            def score_with_feedback(gold: Any, pred: Any, pred_name: str | None = None) -> Any:
+                return exact_match_feedback(output_keys, gold, pred, args.match_mode)
 
         trainset = [to_example(row) for row in train_rows]
         valset = [to_example(row) for row in dev_rows]
@@ -2816,16 +3350,20 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
         starting_program = student
         if args.seed_instructions:
             starting_program = copy.deepcopy(student)
-            apply_instructions(starting_program, load_seed_instructions(Path(args.seed_instructions)))
+            apply_instructions(
+                starting_program,
+                load_seed_instructions(Path(args.seed_instructions)),
+                {name: dspy_name for dspy_name, name in routing.items()},
+            )
             events.emit("seeded", instructions=predictor_instructions(starting_program))
         args.phase = "baseline"
         write_dspy_run_state(args, ledger, "running", None, phase="baseline")
         events.emit("phase", name="baseline")
         baseline_prediction = student(**{key: train_rows[0][key] for key in input_keys})
-        baseline_feedback = exact_match_feedback(output_keys, trainset[0], baseline_prediction, args.match_mode)
+        baseline_feedback = score_with_feedback(trainset[0], baseline_prediction)
 
         def metric(gold: Any, pred: Any, trace: Any = None, pred_name: str | None = None, pred_trace: Any = None) -> Any:
-            return exact_match_feedback(output_keys, gold, pred, args.match_mode)
+            return score_with_feedback(gold, pred, pred_name)
     else:
         builder = getattr(bridge_module, "build_understudy_dspy_gepa", None)
         if not callable(builder):
@@ -2992,6 +3530,23 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
             break
     optimized_instructions = predictor_instructions(optimized)
     instructions_changed = optimized_instructions != baseline_instructions
+    # Per-predictor view for spec runs, keyed by spec name; the instruction maps
+    # above stay keyed by DSPy predictor name so they can seed a later run.
+    predictor_records = (
+        {
+            name: {
+                "dspy_predictor": dspy_name,
+                "output": next(p["output"] for p in task_spec["predictors"] if p["name"] == name),
+                "kind": next(p["type"]["kind"] for p in task_spec["predictors"] if p["name"] == name),
+                "baseline_instructions": baseline_instructions.get(dspy_name),
+                "optimized_instructions": optimized_instructions.get(dspy_name),
+                "instructions_changed": baseline_instructions.get(dspy_name) != optimized_instructions.get(dspy_name),
+            }
+            for dspy_name, name in routing.items()
+        }
+        if task_spec is not None
+        else None
+    )
     final_stats = gepa_run_stats(optimized)
     args.phase = "optimization-finished"
     events.emit(
@@ -3046,9 +3601,19 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
         "spend_enforcement": spend_evidence["spend_enforcement"],
         "baseline_first_score": float(baseline_feedback.score) if baseline_feedback else None,
         "baseline_first_feedback": baseline_feedback.feedback if baseline_feedback else None,
+        "baseline_first_objective_scores": (
+            dict(baseline_feedback.objective_scores) if task_spec is not None and baseline_feedback else None
+        ),
         "baseline_instructions": baseline_instructions,
         "optimized_instructions": optimized_instructions,
         "instructions_changed": instructions_changed,
+        "task_spec": config_payload["task_spec"],
+        "predictors": predictor_records,
+        "instructions_changed_by_predictor": (
+            {name: record["instructions_changed"] for name, record in predictor_records.items()}
+            if predictor_records is not None
+            else None
+        ),
         "gepa_stats": final_stats,
         "search": config_payload["search"],
         "rounds": rounds_log,
@@ -3088,6 +3653,7 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
             ledger,
             events,
             args.match_mode,
+            task_spec,
         )
         holdout_evaluation["candidate_sha256"] = candidate_sha256
         holdout_evaluation["config_sha256"] = config_sha256
@@ -3158,6 +3724,7 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
         "holdout_evaluation": holdout_summary(holdout_evaluation),
         "max_metric_calls": args.max_metric_calls,
         "instructions_changed": instructions_changed,
+        "instructions_changed_by_predictor": candidate["instructions_changed_by_predictor"],
         "spend_enforcement": spend_evidence["spend_enforcement"],
         "config_sha256": config_sha256,
         "candidate_sha256": candidate_sha256,
@@ -3207,6 +3774,9 @@ def dspy_gepa(args: argparse.Namespace) -> None:
         validate_search_options(args)
         if args.no_spend_ledger and args.program_bridge:
             raise ValueError("--no-spend-ledger is not supported with --program-bridge")
+    except TaskSpecError as error:
+        # Spec errors name a spec path, predictor or row index, never row content.
+        emit_dspy_failure(args, ledger, "error", str(error), 3)
     except ValueError:
         emit_dspy_failure(args, ledger, "error", "invalid-runtime-input", 3)
     events.emit(
@@ -3223,6 +3793,13 @@ def dspy_gepa(args: argparse.Namespace) -> None:
         rounds=args.rounds,
         proposals_per_iteration=args.proposals_per_iteration,
         match_mode=args.match_mode,
+        component_selector=args.component_selector,
+        frontier_type=args.frontier_type,
+        task_spec_predictors=(
+            [predictor["name"] for predictor in args.task_spec_data["predictors"]]
+            if args.task_spec_data is not None
+            else None
+        ),
     )
     try:
         _dspy_gepa_execute(args, ledger)
@@ -3250,6 +3827,8 @@ def dspy_gepa(args: argparse.Namespace) -> None:
         elif isinstance(error, WorkloadAdmissionError):
             emit_dspy_failure(args, ledger, "admission-blocked", str(error), 6)
         elif isinstance(error, UnsupportedTeacherError):
+            emit_dspy_failure(args, ledger, "error", str(error), 3)
+        elif isinstance(error, TaskSpecError):
             emit_dspy_failure(args, ledger, "error", str(error), 3)
         elif isinstance(error, ImportError):
             emit_dspy_failure(args, ledger, "error", "runtime-dependency-error", 3)
@@ -3597,7 +4176,8 @@ def main() -> None:
     dspy_gepa_parser.add_argument("--samples", default=None)
     dspy_gepa_parser.add_argument("--input-keys", default="")
     dspy_gepa_parser.add_argument("--output-keys", default="")
-    dspy_gepa_parser.add_argument("--module", choices=("predict", "cot"), default="predict")
+    # None means "predict", or the task spec's module when --task-spec is given.
+    dspy_gepa_parser.add_argument("--module", choices=("predict", "cot"), default=None)
     dspy_gepa_parser.add_argument("--model", required=True)
     dspy_gepa_parser.add_argument("--reflection-model", required=True)
     dspy_gepa_parser.add_argument("--max-metric-calls", type=positive_int_arg, default=3)
@@ -3647,6 +4227,8 @@ def main() -> None:
     dspy_gepa_parser.add_argument("--evaluate-holdout", action="store_true")
     dspy_gepa_parser.add_argument("--match-mode", choices=MATCH_MODES, default="exact")
     dspy_gepa_parser.add_argument("--seed-instructions", default=None)
+    dspy_gepa_parser.add_argument("--task-spec", default=None)
+    dspy_gepa_parser.add_argument("--frontier-type", default="instance")
     # Search settings are parsed by validate_search_options so a bad value
     # fails with the run's JSON error payload instead of an argparse exit.
     dspy_gepa_parser.add_argument("--rounds", default="1")

@@ -100,6 +100,8 @@ type AdapterRunOptions = {
   evaluateHoldout?: boolean;
   matchMode?: string;
   seedInstructions?: string;
+  taskSpec?: string;
+  frontierType?: string;
   rounds?: string;
   minRoundGain?: string;
   stopAfterStale?: string;
@@ -173,8 +175,24 @@ const adapterRegistry: Record<string, UvAdapterSpec> = {
       if (options.programBridge && !options.admissionOnly && !options.admissionReceipt) {
         throw new Error("bridge compilation requires --admission-receipt from a prior --admission-only run");
       }
-      if (!options.programBridge && (!options.inputKeys?.length || !options.outputKeys?.length)) {
-        throw new Error("--input-keys and --output-keys are required for dspy-gepa unless --program-bridge is supplied");
+      if (options.taskSpec && options.programBridge) {
+        throw new Error("--task-spec is not supported with --program-bridge");
+      }
+      if (options.taskSpec && options.outputKeys?.length) {
+        throw new Error("--task-spec and --output-keys are mutually exclusive");
+      }
+      if (options.taskSpec && options.inputKeys?.length) {
+        throw new Error("--task-spec defines the input keys; drop --input-keys");
+      }
+      const taskSpec = options.taskSpec ? requireTaskSpec(options.taskSpec) : undefined;
+      if (
+        !options.programBridge &&
+        !taskSpec &&
+        (!options.inputKeys?.length || !options.outputKeys?.length)
+      ) {
+        throw new Error(
+          "--input-keys and --output-keys (or --task-spec) are required for dspy-gepa unless --program-bridge is supplied",
+        );
       }
       if ((options.inputKeys?.length && !options.outputKeys?.length) || (!options.inputKeys?.length && options.outputKeys?.length)) {
         throw new Error("--input-keys and --output-keys must be supplied together");
@@ -208,12 +226,23 @@ const adapterRegistry: Record<string, UvAdapterSpec> = {
       if (!["round_robin", "all"].includes(componentSelector)) {
         throw new Error("--component-selector must be round_robin or all");
       }
+      const frontierType = options.frontierType ?? "instance";
+      if (!(frontierTypes as readonly string[]).includes(frontierType)) {
+        throw new Error(`--frontier-type must be one of: ${frontierTypes.join(", ")}`);
+      }
+      if (frontierType !== "instance" && !taskSpec) {
+        // Objective frontiers need per-objective scores, which only spec metrics return.
+        throw new Error(`--frontier-type ${frontierType} requires --task-spec`);
+      }
+      if (taskSpec && options.module !== undefined && options.module !== taskSpec.module) {
+        throw new Error(`--module ${options.module} differs from the task spec's module (${taskSpec.module})`);
+      }
       const args = [
         "dspy-gepa",
         "--repo",
         repo,
         "--module",
-        options.module ?? "predict",
+        taskSpec?.module ?? options.module ?? "predict",
         "--model",
         options.model,
         "--reflection-model",
@@ -245,6 +274,8 @@ const adapterRegistry: Record<string, UvAdapterSpec> = {
         candidateSelectionStrategy,
         "--component-selector",
         componentSelector,
+        "--frontier-type",
+        frontierType,
         "--use-merge",
         options.useMerge === true ? "true" : "false",
         "--max-merge-invocations",
@@ -264,6 +295,9 @@ const adapterRegistry: Record<string, UvAdapterSpec> = {
       }
       if (options.inputKeys?.length && options.outputKeys?.length) {
         args.push("--input-keys", options.inputKeys.join(","), "--output-keys", options.outputKeys.join(","));
+      }
+      if (taskSpec) {
+        args.push("--task-spec", taskSpec.path);
       }
       if (options.programBridge) {
         const bridgePath = requireRegularFile(options.programBridge, "--program-bridge");
@@ -432,6 +466,7 @@ function nonNegativeInteger(value: string, flag: string): number {
 
 const pricesFromGatewayModes = ["auto", "off", "require"] as const;
 const matchModes = ["exact", "case-insensitive"] as const;
+const frontierTypes = ["instance", "objective", "hybrid", "cartesian"] as const;
 
 function priceKey(model: string): string {
   return model.startsWith("openai/") ? model.slice("openai/".length) : model;
@@ -598,6 +633,124 @@ function requireRegularFile(pathInput: string, flag: string): string {
     throw new Error(`${flag} must point to a non-symlink regular file`);
   }
   return path;
+}
+
+// Declarative multi-predictor programs for dspy-gepa. The runtime re-validates the
+// spec (it is the authority) and checks every used sample row against it before
+// any provider call; this check fails fast on a malformed file. Keep the two in step.
+const taskSpecSchemaVersion = "understudy.dspy_gepa_task_spec.v1";
+const taskSpecKinds = ["label", "label-set", "text"];
+const taskSpecPredictorName = /^[a-z][a-z0-9_]{0,63}$/;
+const taskSpecFieldName = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+// dspy.Module members a predictor attribute must not shadow, and ChainOfThought's field.
+const taskSpecReservedNames = new Set([
+  "batch", "callbacks", "deepcopy", "dump_state", "forward", "get_lm", "history",
+  "inspect_history", "load", "load_state", "map_named_predictors", "named_parameters",
+  "named_predictors", "named_sub_modules", "parameters", "predictors", "reset_copy",
+  "save", "set_lm",
+]);
+const taskSpecReservedFields = new Set(["reasoning"]);
+const taskSpecMaxPredictors = 32;
+const taskSpecMaxLabels = 256;
+const taskSpecMaxInstructions = 20000;
+
+type TaskSpecSummary = { path: string; module: "predict" | "cot"; inputs: string[]; outputs: string[] };
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function rejectUnknownKeys(value: Record<string, unknown>, allowed: string[], path: string): void {
+  const unknown = Object.keys(value).filter((key) => !allowed.includes(key)).sort();
+  if (unknown.length) {
+    throw new Error(`--task-spec ${path} has unknown keys: ${unknown.join(", ")}`);
+  }
+}
+
+function requireTaskSpec(pathInput: string): TaskSpecSummary {
+  const path = requireRegularFile(pathInput, "--task-spec");
+  if ((lstatSync(path).mode & 0o400) === 0) {
+    throw new Error("--task-spec must be readable by its owner");
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    throw new Error("--task-spec must contain valid JSON");
+  }
+  if (!isPlainObject(raw)) throw new Error("--task-spec must contain a JSON object");
+  rejectUnknownKeys(raw, ["schema_version", "description", "inputs", "module", "predictors"], "spec");
+  if (raw.schema_version !== taskSpecSchemaVersion) {
+    throw new Error(`--task-spec schema_version must be ${taskSpecSchemaVersion}`);
+  }
+  const inputs = raw.inputs;
+  if (
+    !Array.isArray(inputs) ||
+    inputs.length === 0 ||
+    !inputs.every((key) => typeof key === "string" && taskSpecFieldName.test(key) && !taskSpecReservedFields.has(key)) ||
+    new Set(inputs).size !== inputs.length
+  ) {
+    throw new Error("--task-spec inputs must be a non-empty list of unique field names");
+  }
+  const module = raw.module ?? "predict";
+  if (module !== "predict" && module !== "cot") throw new Error("--task-spec module must be predict or cot");
+  const predictors = raw.predictors;
+  if (!Array.isArray(predictors) || predictors.length === 0 || predictors.length > taskSpecMaxPredictors) {
+    throw new Error(`--task-spec predictors must be a list of 1 to ${taskSpecMaxPredictors} predictors`);
+  }
+  const names = new Set<string>();
+  const outputs: string[] = [];
+  predictors.forEach((entry, index) => {
+    const at = `predictors[${index}]`;
+    if (!isPlainObject(entry)) throw new Error(`--task-spec ${at} must be an object`);
+    rejectUnknownKeys(entry, ["name", "output", "instructions", "type"], at);
+    const name = entry.name;
+    if (typeof name !== "string" || !taskSpecPredictorName.test(name) || taskSpecReservedNames.has(name)) {
+      throw new Error(`--task-spec ${at}.name must match ^[a-z][a-z0-9_]{0,63}$ and not be a dspy.Module member`);
+    }
+    if (names.has(name)) throw new Error(`--task-spec ${at}.name repeats another predictor's name`);
+    names.add(name);
+    const output = entry.output ?? name;
+    if (
+      typeof output !== "string" ||
+      !taskSpecFieldName.test(output) ||
+      taskSpecReservedFields.has(output) ||
+      inputs.includes(output) ||
+      outputs.includes(output)
+    ) {
+      throw new Error(`--task-spec ${at}.output must be a field name that is not reserved, an input, or another output`);
+    }
+    outputs.push(output);
+    const instructions = entry.instructions;
+    if (
+      instructions !== undefined &&
+      (typeof instructions !== "string" || !instructions.trim() || instructions.length > taskSpecMaxInstructions)
+    ) {
+      throw new Error(`--task-spec ${at}.instructions must be non-empty text of at most ${taskSpecMaxInstructions} characters`);
+    }
+    const type = entry.type;
+    if (!isPlainObject(type) || !taskSpecKinds.includes(type.kind as string)) {
+      throw new Error(`--task-spec ${at}.type.kind must be label, label-set, or text`);
+    }
+    rejectUnknownKeys(type, ["kind", "labels"], `${at}.type`);
+    if (type.kind === "text") {
+      if ("labels" in type) throw new Error(`--task-spec ${at}.type.labels is not allowed for text`);
+      return;
+    }
+    const labels = type.labels;
+    if (
+      !Array.isArray(labels) ||
+      labels.length === 0 ||
+      labels.length > taskSpecMaxLabels ||
+      !labels.every((label) => typeof label === "string" && label.length > 0 && label.trim() === label) ||
+      new Set(labels.map((label: string) => label.split(/\s+/).join(" ").toLowerCase())).size !== labels.length
+    ) {
+      throw new Error(
+        `--task-spec ${at}.type.labels must be 1 to ${taskSpecMaxLabels} unique non-empty strings without surrounding whitespace`,
+      );
+    }
+  });
+  return { path, module, inputs: inputs as string[], outputs };
 }
 
 function rejectBridgeConfigSecrets(value: unknown, path = "bridge_config"): void {
