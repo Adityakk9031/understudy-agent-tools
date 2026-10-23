@@ -114,14 +114,25 @@ Schema `understudy.dspy_gepa_task_spec.v1`:
 |---|---|---|
 | `schema_version` | yes | `understudy.dspy_gepa_task_spec.v1` |
 | `description` | no | Free text for people; ignored by the runtime |
-| `inputs` | yes | Input field names every predictor reads (unique identifiers; `reasoning` is reserved) |
+| `inputs` | yes | Input field names every predictor reads (unique, `^[A-Za-z][A-Za-z0-9_]{0,63}$`, not a reserved field name; see below) |
 | `module` | no | `predict` (default) or `cot`. `--module`, if given, must agree |
 | `predictors[]` | yes, 1 to 32 | One entry per predictor |
 | `predictors[].name` | yes | `^[a-z][a-z0-9_]{0,63}$`, unique, not a `dspy.Module` member such as `forward` or `predictors` |
-| `predictors[].output` | no | Output field name and the sample-row key holding its gold value; defaults to `name`. Unique, not an input, not `reasoning` |
+| `predictors[].output` | no | Output field name and the sample-row key holding its gold value; defaults to `name`. Unique, not an input, same pattern as `inputs`, not a reserved field name |
 | `predictors[].instructions` | no | Seed instruction text; DSPy's default ("Given the fields ...") when absent |
 | `predictors[].type.kind` | yes | `label`, `label-set`, or `text` |
 | `predictors[].type.labels` | for `label` and `label-set` | 1 to 256 unique strings without surrounding whitespace, unique ignoring case; not allowed for `text` |
+
+Reserved field names fail the spec because DSPy would read them back wrong or
+reject them late: `reasoning` (added by `cot`); the `dspy.Example` and
+`dspy.Prediction` members (`labels`, `items`, `keys`, `values`, `inputs`, `get`,
+`copy`, `toDict`, `without`, `with_inputs`, `completions`, `from_completions`,
+`get_lm_usage`, `set_lm_usage`), where attribute access returns the method
+instead of the value; `fields`, `instructions`, `signature`, `model_config`, and
+any `model_` prefix, which the signature class rejects; and `config`, `demos`,
+`lm`, `new_signature`, and `prediction`, which `dspy.Predict` consumes as
+arguments. The runtime also rechecks field names against the installed DSPy's
+`Example` and `Prediction` members when it builds the program.
 
 Unknown keys anywhere fail the spec. The CLI checks the file (regular,
 non-symlink, owner-readable, valid) before it resolves credentials, and the
@@ -134,14 +145,25 @@ how it is scored:
 
 | `kind` | DSPy output type | Gold value in a sample row | Score for that predictor |
 |---|---|---|---|
-| `label` | `Literal[...labels]` | one label string | 1 if the prediction matches under `--match-mode`, else 0 |
-| `label-set` | `list[Literal[...labels]]` | a list of labels, or a `{label: true/false}` object (the tutorial's format; absent labels count as false) | Per-label agreement over the spec's label set: (labels correctly included + labels correctly left out) / number of labels |
+| `label` | `Literal[...labels]` | one label string | 1 if the prediction is the gold label, else 0. Parsing is exact, so `--match-mode` does not apply |
+| `label-set` | `list[Literal[...labels]]` | a list of labels, or a `{label: true/false}` object (the tutorial's format; absent labels count as false) | Per-label agreement over the spec's label set: (labels correctly included + labels correctly left out) / number of labels. Parsing is exact, as for `label` |
 | `text` | `str` | a string | 1 if it matches under `--match-mode` (exact or case-insensitive, as without a spec), else 0 |
 
 Typed outputs matter: DSPy tells the student the allowed labels and rejects
 anything else at parse time. In the tutorial reproduction, typing a single
 urgency predictor as a `Literal` lifted its baseline from 20% to 57% before any
 optimization.
+
+A rejected answer (`Low` for the label `low`, or a label outside the set) makes
+DSPy raise `AdapterParseError` for that predictor. The program catches it per
+predictor, so it scores 0 for that predictor only, with feedback that the answer
+could not be parsed as one of the listed labels and what the gold label was; the
+other predictors in the row are still scored. The row therefore always reports
+every `objective_scores` entry: a failed row would report none, and GEPA's
+objective, hybrid, and cartesian frontiers average each objective only over the
+rows that report it. The raw response is kept in DSPy's trace so the reflector
+sees what the student wrote. Spend stops and provider errors are not parse
+errors and still end the row or the run.
 
 Every sample row that is used (train and dev, and holdout rows when
 `--evaluate-holdout` is set) is checked against the spec before any provider

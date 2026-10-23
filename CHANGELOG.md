@@ -249,6 +249,19 @@ uses semantic-ish versioning (minor = new skill or new capability, patch = fixes
   no longer reserve in between. Gateway prices apply only to roles whose bound
   base URL is the gateway's, not to any bridge route that names itself
   `understudy-gateway`.
+- **`dspy-gepa` task specs read values, not methods, and survive parse
+  failures.** Spec outputs and inputs are read by key, since attribute access
+  on `dspy.Example`/`Prediction` returns methods for names such as `labels` or
+  `items`; those member names, `_`-prefixed names, `model_*`, `signature`,
+  `instructions`, `fields`, and the arguments `dspy.Predict` consumes
+  (`config`, `demos`, `lm`, `prediction`) are refused in the CLI and the
+  runtime, which also rechecks the installed DSPy's members. A predictor whose
+  answer fails to parse (`Low` for the label `low`) now scores 0 for that
+  predictor with format feedback instead of failing the whole row, so every row
+  reports all `objective_scores` and objective frontiers no longer favor
+  candidates that fail most rows. Spec rows are validated before the gateway
+  price lookup. The docs now say `--match-mode` applies to `text` predictors
+  only.
 - **Honest backend readiness for the same training plan.** Compiling a portable
   plan no longer claims a backend can run a recipe it has no executor for:
   `adapter_implemented` now comes from the local MLX and Tinker executor

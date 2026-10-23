@@ -252,13 +252,25 @@ class GEPA:
 // dspy.Module attribute discovery ("name" for Predict, "name.predict" for
 // ChainOfThought, as DSPy 3.4.1 names them), and a GEPA that calls the metric the
 // way DSPy does (pred_name=None to score, then once per predictor for feedback).
-// Seed predictors answer STUB_ANSWERS[output][0]; evolved ones answer [1].
+// Seed predictors answer STUB_ANSWERS[output][0]; evolved ones answer [1]. An
+// answer of "__unparseable__" raises AdapterParseError, as DSPy does for a label
+// outside the Literal. Example and Prediction keep fields in a store, as DSPy's
+// do, so attribute access returns their methods for names such as labels or items.
 export function writeTaskSpecDspyStubs(stubRoot) {
   const dspyRoot = join(stubRoot, "dspy");
-  mkdirSync(dspyRoot, { recursive: true });
+  mkdirSync(join(dspyRoot, "utils"), { recursive: true });
   writePythonDistributionMetadata(stubRoot);
   writeGepaPackageStubs(stubRoot);
   writeScoreWithFeedbackStub(dspyRoot);
+  writeFileSync(join(dspyRoot, "utils", "__init__.py"), "", "utf8");
+  writeFileSync(join(dspyRoot, "utils", "exceptions.py"), `
+class AdapterParseError(Exception):
+    def __init__(self, adapter_name, signature, lm_response, message=None, parsed_result=None):
+        super().__init__(message or "parse failed")
+        self.signature = signature
+        self.lm_response = lm_response
+        self.parsed_result = parsed_result
+`, "utf8");
   writeDspyClientsEngineStub(dspyRoot, `
         with open(os.environ["PROVIDER_SENTINEL"], "a", encoding="utf-8") as handle:
             handle.write("called\\n")
@@ -270,6 +282,7 @@ import os
 from types import SimpleNamespace
 
 configured_lm = None
+settings = SimpleNamespace(trace=None, max_trace_size=10000)
 
 def configure(lm):
     global configured_lm
@@ -295,18 +308,41 @@ class Signature:
     def output_field(self):
         return [name for name, (_, field) in self.fields.items() if field.kind == "output"][0]
 
-class Prediction(SimpleNamespace):
-    pass
-
 class Example:
     def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-        self._inputs = []
+        self._store = dict(kwargs)
+        self._input_keys = []
+    def __getattr__(self, key):
+        if key.startswith("_"):
+            raise AttributeError(key)
+        try:
+            return self._store[key]
+        except KeyError:
+            raise AttributeError(key) from None
+    def __getitem__(self, key):
+        return self._store[key]
     def with_inputs(self, *keys):
-        self._inputs = list(keys)
+        self._input_keys = list(keys)
         return self
     def inputs(self):
-        return {key: getattr(self, key) for key in self._inputs}
+        return {key: self._store[key] for key in self._input_keys}
+    def labels(self):
+        return {key: value for key, value in self._store.items() if key not in self._input_keys}
+    def items(self):
+        return self._store.items()
+    def keys(self):
+        return self._store.keys()
+    def values(self):
+        return self._store.values()
+    def get(self, key, default=None):
+        return self._store.get(key, default)
+    def to_metadata(self):
+        # Stands in for a member a later dspy release adds; the runtime rechecks
+        # field names against the installed classes.
+        return {}
+
+class Prediction(Example):
+    pass
 
 def _answers():
     return json.loads(os.environ.get("STUB_ANSWERS", "{}"))
@@ -314,15 +350,26 @@ def _answers():
 class Predict:
     def __init__(self, signature):
         self.signature = signature
+    def predictors(self):
+        return [self]
     def __call__(self, **kwargs):
         configured_lm(prompt=str(sorted(kwargs)))
         output = self.signature.output_field()
         pair = _answers().get(output, ["seed", "evolved"])
-        return Prediction(**{output: pair[1] if "evolved" in self.signature.instructions else pair[0]})
+        answer = pair[1] if "evolved" in self.signature.instructions else pair[0]
+        if answer == "__unparseable__":
+            from dspy.utils.exceptions import AdapterParseError
+            raise AdapterParseError("ChatAdapter", self.signature, f"[[ ## {output} ## ]]\\nNot A Label")
+        prediction = Prediction(**{output: answer})
+        if settings.trace is not None:
+            settings.trace.append((self, dict(kwargs), prediction))
+        return prediction
 
 class ChainOfThought:
     def __init__(self, signature):
         self.predict = Predict(signature)
+    def predictors(self):
+        return [self.predict]
     def __call__(self, **kwargs):
         return self.predict(**kwargs)
 
@@ -356,7 +403,15 @@ class GEPA:
     def compile(self, student, trainset=None, valset=None):
         copy.deepcopy(self.reflection_lm)(prompt="reflection")
         example = valset[0]
+        settings.trace = []
         prediction = student(**example.inputs())
+        trace = [
+            {"predictor": name, "outputs": dict(entry[2].items())}
+            for entry in settings.trace
+            for name, predictor in student.named_predictors()
+            if predictor is entry[0]
+        ]
+        settings.trace = None
         scored = self.metric(example, prediction, None, None, None)
         calls = [{"pred_name": None, "score": scored.score, "objective_scores": scored.objective_scores}]
         names = [name for name, _ in student.named_predictors()]
@@ -377,6 +432,7 @@ class GEPA:
         with open(os.environ["GEPA_KWARGS_PATH"], "w", encoding="utf-8") as handle:
             json.dump({
                 "metric_calls": calls,
+                "trace": trace,
                 "predictor_names": names,
                 "seed_instructions": {name: predictor.signature.instructions for name, predictor in student.named_predictors()},
                 "field_types": {

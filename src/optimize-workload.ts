@@ -641,7 +641,7 @@ function requireRegularFile(pathInput: string, flag: string): string {
 const taskSpecSchemaVersion = "understudy.dspy_gepa_task_spec.v1";
 const taskSpecKinds = ["label", "label-set", "text"];
 const taskSpecPredictorName = /^[a-z][a-z0-9_]{0,63}$/;
-const taskSpecFieldName = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+const taskSpecFieldName = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 // dspy.Module members a predictor attribute must not shadow, and ChainOfThought's field.
 const taskSpecReservedNames = new Set([
   "batch", "callbacks", "deepcopy", "dump_state", "forward", "get_lm", "history",
@@ -649,7 +649,18 @@ const taskSpecReservedNames = new Set([
   "named_predictors", "named_sub_modules", "parameters", "predictors", "reset_copy",
   "save", "set_lm",
 ]);
-const taskSpecReservedFields = new Set(["reasoning"]);
+// Field names that fail late or read back wrong: ChainOfThought's field,
+// dspy.Example/Prediction members (attribute access returns the method, not the
+// value), names the Signature class or pydantic reject (and any model_ prefix), and
+// keyword arguments Predict consumes. Keep in step with TASK_SPEC_RESERVED_FIELDS.
+const taskSpecReservedFields = new Set([
+  "reasoning",
+  "completions", "copy", "from_completions", "get", "get_lm_usage", "inputs", "items",
+  "keys", "labels", "set_lm_usage", "toDict", "values", "with_inputs", "without",
+  "fields", "instructions", "model_config", "signature",
+  "config", "demos", "lm", "new_signature", "prediction",
+]);
+const taskSpecReservedField = (name: string): boolean => taskSpecReservedFields.has(name) || name.startsWith("model_");
 const taskSpecMaxPredictors = 32;
 const taskSpecMaxLabels = 256;
 const taskSpecMaxInstructions = 20000;
@@ -687,10 +698,10 @@ function requireTaskSpec(pathInput: string): TaskSpecSummary {
   if (
     !Array.isArray(inputs) ||
     inputs.length === 0 ||
-    !inputs.every((key) => typeof key === "string" && taskSpecFieldName.test(key) && !taskSpecReservedFields.has(key)) ||
+    !inputs.every((key) => typeof key === "string" && taskSpecFieldName.test(key) && !taskSpecReservedField(key)) ||
     new Set(inputs).size !== inputs.length
   ) {
-    throw new Error("--task-spec inputs must be a non-empty list of unique field names");
+    throw new Error("--task-spec inputs must be a non-empty list of unique, non-reserved field names");
   }
   const module = raw.module ?? "predict";
   if (module !== "predict" && module !== "cot") throw new Error("--task-spec module must be predict or cot");
@@ -714,7 +725,7 @@ function requireTaskSpec(pathInput: string): TaskSpecSummary {
     if (
       typeof output !== "string" ||
       !taskSpecFieldName.test(output) ||
-      taskSpecReservedFields.has(output) ||
+      taskSpecReservedField(output) ||
       inputs.includes(output) ||
       outputs.includes(output)
     ) {

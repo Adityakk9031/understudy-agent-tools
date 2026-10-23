@@ -189,6 +189,13 @@ describe("dspy-gepa task spec validation", () => {
         [facilitySpec({ predictors: [{ ...predictor, name: "Urgency" }] }), [], /name must match/],
         [facilitySpec({ predictors: [{ ...predictor, output: "message" }] }), [], /output must be a field name that is not reserved, an input/],
         [facilitySpec({ predictors: [{ ...predictor, output: "reasoning" }] }), [], /output must be a field name that is not reserved/],
+        // dspy.Example/Prediction members read back as methods; the others fail late in DSPy.
+        ...["labels", "items", "_private", "model_config", "model_extra", "signature", "instructions", "fields", "config", "lm"].map(
+          (output) => [facilitySpec({ predictors: [{ ...predictor, output }] }), [], /output must be a field name that is not reserved/],
+        ),
+        ...["items", "inputs", "demos", "prediction", "_message"].map(
+          (input) => [facilitySpec({ inputs: [input] }), [], /inputs must be a non-empty list of unique, non-reserved field names/],
+        ),
         [facilitySpec({ predictors: [{ ...predictor, type: { kind: "label-set" } }] }), [], /labels must be 1 to 256 unique/],
         [facilitySpec({ predictors: [{ ...predictor, type: { kind: "label", labels: ["a", "A"] } }] }), [], /labels must be 1 to 256 unique/],
         [facilitySpec({ predictors: [{ ...predictor, type: { kind: "label", labels: [" a"] } }] }), [], /without surrounding whitespace/],
@@ -314,6 +321,59 @@ print(json.dumps({
       assert.match(seen.dup_output, /predictors\[1\]\.output repeats another predictor's output/);
       assert.match(seen.bad_labels, /predictors\[2\]\.type\.labels must be/);
       assert.match(seen.unknown_type_key, /predictors\[0\]\.type has unknown keys/);
+    }));
+
+  it("rejects field names DSPy reads back as methods or rejects late, also against the installed dspy", { skip: !pythonAvailable }, () =>
+    withRepo((repo) => {
+      const runtime = writeRuntime(repo);
+      const stubRoot = join(repo, "task-spec-stubs");
+      writeTaskSpecDspyStubs(stubRoot);
+      const seen = runtimeScript(runtime, `
+import copy, dspy
+base = ${JSON.stringify(facilitySpec())}
+def rejected(mutate):
+    raw = copy.deepcopy(base)
+    mutate(raw)
+    try:
+        rt.validate_task_spec(raw)
+        return False
+    except rt.TaskSpecError:
+        return True
+names = ["labels", "items", "keys", "values", "inputs", "get", "copy", "toDict", "without", "with_inputs",
+         "completions", "from_completions", "get_lm_usage", "set_lm_usage", "_private", "model_config",
+         "model_extra", "signature", "instructions", "fields", "config", "demos", "lm", "new_signature", "prediction"]
+def as_output(name):
+    def mutate(raw): raw["predictors"][0]["output"] = name
+    return mutate
+def as_input(name):
+    def mutate(raw): raw["inputs"] = [name]
+    return mutate
+# A member the static list does not know (a later dspy) is caught when the program is built.
+later = rt.validate_task_spec({**base, "inputs": ["to_metadata"]})
+try:
+    rt.build_task_spec_program(dspy, later)
+    later_member = "built"
+except rt.TaskSpecError as error:
+    later_member = str(error)
+store = dspy.Prediction(labels=["a"], items="x")
+print(json.dumps({
+    "output_rejected": [name for name in names if not rejected(as_output(name))],
+    "input_rejected": [name for name in names if not rejected(as_input(name))],
+    "plain_ok": not rejected(as_output("Label_2")),
+    "later_member": later_member,
+    "attribute_is_method": callable(store.labels),
+    "by_key": [rt.field_value(store, "labels"), rt.field_value(store, "items"), rt.field_value(store, "nope")],
+    "namespace": rt.field_value(SimpleNamespace(urgency="high"), "urgency"),
+}))
+`, { ...baseEnv, PYTHONPATH: stubRoot });
+      assert.deepEqual(seen.output_rejected, []);
+      assert.deepEqual(seen.input_rejected, []);
+      assert.equal(seen.plain_ok, true);
+      assert.equal(seen.later_member, "task-spec-invalid: field name to_metadata is a dspy.Example or dspy.Prediction member");
+      // Attribute access returns the store's method; the runtime reads values by key.
+      assert.equal(seen.attribute_is_method, true);
+      assert.deepEqual(seen.by_key, [["a"], "x", null]);
+      assert.equal(seen.namespace, "high");
     }));
 
   it("fails closed on a bad gold value, naming the row index and never its content", { skip: !pythonAvailable }, () =>
@@ -552,6 +612,48 @@ describe("dspy-gepa task spec runs", () => {
       // Baseline row, reflection, the stub GEPA's scoring row, then 2 holdout rows per
       // program; every row costs one call per predictor.
       assert.equal(readFileSync(sentinel, "utf8").trim().split("\n").length, 3 + 1 + 3 + 3 * 2 * 2);
+    }));
+
+  it("scores an unparseable answer 0 for that predictor instead of failing the row", { skip: !pythonAvailable }, () =>
+    withRepo((repo) => {
+      // The seed urgency predictor answers outside its Literal, so DSPy raises
+      // AdapterParseError; the evolved one answers correctly.
+      const answers = { ...stubAnswers, urgency: ["__unparseable__", "high"] };
+      const { result, seen, payload } = runSpec(repo, {
+        args: ["--evaluate-holdout", "--frontier-type", "objective"],
+        env: { STUB_ANSWERS: JSON.stringify(answers) },
+      });
+      assert.equal(result.status, 0, result.stderr);
+      const gepa = seen();
+      // The row still reports every objective, so GEPA's objective frontier averages
+      // over every row instead of only the rows that parsed.
+      assert.deepEqual(gepa.metric_calls[0].objective_scores, { urgency: 0, sentiment: 0, categories: 1 / 3 });
+      const urgency = gepa.metric_calls.find((call) => call.pred_name === "urgency.predict");
+      assert.equal(
+        urgency.feedback,
+        "Your urgency answer could not be parsed as one of the allowed labels: `['low', 'medium', 'high']`. "
+          + "The correct urgency is `high`. Answer with labels copied exactly as listed, with the same letter case "
+          + "and spelling, and nothing else.",
+      );
+      // The failed predictor still leaves a trace entry with the raw response to reflect on.
+      assert.deepEqual(gepa.trace.find((entry) => entry.predictor === "urgency.predict").outputs, {
+        urgency: "[[ ## urgency ## ]]\nNot A Label",
+      });
+      assert.deepEqual(gepa.trace.find((entry) => entry.predictor === "sentiment.predict").outputs, { sentiment: "neutral" });
+      const evaluation = readJson(join(runDir(repo), "holdout-evaluation.json"));
+      assert.equal(evaluation.baseline.errors, 0);
+      assert.equal(evaluation.baseline.by_predictor.urgency.score, 0);
+      assert.equal(evaluation.optimized.by_predictor.urgency.score, 1);
+      assert.equal(evaluation.rows[0].baseline.urgency, "");
+      assert.equal(payload().status, "candidate-created");
+
+      // Only parse errors are caught: a spend stop inside a predictor still ends the run.
+      const blocked = runSpec(mkdtempSync(join(repo, "blocked-")), {
+        args: ["--budget-usd", "0.000001"],
+        env: { STUB_ANSWERS: JSON.stringify(answers) },
+      });
+      assert.equal(blocked.result.status, 4, blocked.result.stderr);
+      assert.equal(blocked.payload().status, "budget-blocked");
     }));
 
   it("seeds predictors by spec name or DSPy name", { skip: !pythonAvailable }, () =>

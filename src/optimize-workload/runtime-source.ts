@@ -1242,8 +1242,8 @@ def exact_match_feedback(output_keys: list[str], gold: Any, pred: Any, match_mod
     matches = []
     gaps = []
     for key in output_keys:
-        expected = str(getattr(gold, key, "")).strip()
-        actual = str(getattr(pred, key, "")).strip()
+        expected = str(field_value(gold, key, "")).strip()
+        actual = str(field_value(pred, key, "")).strip()
         ok = normalize_label(actual, match_mode) == normalize_label(expected, match_mode)
         matches.append(ok)
         if not ok:
@@ -1263,7 +1263,7 @@ TASK_SPEC_SCHEMA_VERSION = "understudy.dspy_gepa_task_spec.v1"
 TASK_SPEC_KINDS = ("label", "label-set", "text")
 TASK_SPEC_MODULES = ("predict", "cot")
 TASK_SPEC_PREDICTOR_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-TASK_SPEC_FIELD_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+TASK_SPEC_FIELD_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 # dspy.Module members a predictor attribute must not shadow (rechecked against the
 # installed dspy when the program is built), and the field ChainOfThought adds.
 TASK_SPEC_RESERVED_NAMES = frozenset({
@@ -1272,7 +1272,38 @@ TASK_SPEC_RESERVED_NAMES = frozenset({
     "named_predictors", "named_sub_modules", "parameters", "predictors", "reset_copy",
     "save", "set_lm",
 })
-TASK_SPEC_RESERVED_FIELDS = frozenset({"reasoning"})
+# Field names (inputs and outputs) that fail late or read back wrong: the field
+# ChainOfThought adds; dspy.Example/Prediction members, which attribute access
+# returns instead of the value (rechecked against the installed dspy); names the
+# Signature class or pydantic reject (plus any model_ prefix); and the keyword
+# arguments Predict consumes instead of passing to the signature.
+TASK_SPEC_RESERVED_FIELDS = frozenset({
+    "reasoning",
+    "completions", "copy", "from_completions", "get", "get_lm_usage", "inputs", "items",
+    "keys", "labels", "set_lm_usage", "toDict", "values", "with_inputs", "without",
+    "fields", "instructions", "model_config", "signature",
+    "config", "demos", "lm", "new_signature", "prediction",
+})
+
+
+def task_spec_reserved_field(name: str) -> bool:
+    return name in TASK_SPEC_RESERVED_FIELDS or name.startswith("model_")
+
+
+def field_value(record: Any, key: str, default: Any = None) -> Any:
+    """Read one field from a dspy.Example, Prediction, mapping, or namespace by key.
+
+    getattr on an Example or Prediction returns the bound method for names such as
+    labels or items rather than the stored value, so stores are read by key.
+    """
+    if isinstance(record, Mapping):
+        return record.get(key, default)
+    if callable(getattr(type(record), "__getitem__", None)):
+        try:
+            return record[key]
+        except (KeyError, IndexError, TypeError):
+            return default
+    return getattr(record, key, default)
 TASK_SPEC_MAX_PREDICTORS = 32
 TASK_SPEC_MAX_LABELS = 256
 TASK_SPEC_MAX_INSTRUCTIONS = 20000
@@ -1309,7 +1340,7 @@ def validate_task_spec(raw: Any) -> dict[str, Any]:
         or len(set(inputs)) != len(inputs)
     ):
         raise bad("inputs", "must be a non-empty list of unique field names")
-    if TASK_SPEC_RESERVED_FIELDS & set(inputs):
+    if any(task_spec_reserved_field(key) for key in inputs):
         raise bad("inputs", "must not use a reserved field name")
     module = raw.get("module", "predict")
     if module not in TASK_SPEC_MODULES:
@@ -1338,7 +1369,7 @@ def validate_task_spec(raw: Any) -> dict[str, Any]:
         output = entry.get("output", name)
         if not isinstance(output, str) or not TASK_SPEC_FIELD_NAME.match(output):
             raise bad(f"{path}.output", "must be a field name")
-        if output in TASK_SPEC_RESERVED_FIELDS or output in inputs:
+        if task_spec_reserved_field(output) or output in inputs:
             raise bad(f"{path}.output", "must not be reserved or an input")
         if output in outputs:
             raise bad(f"{path}.output", "repeats another predictor's output")
@@ -1489,9 +1520,20 @@ def task_spec_signature(dspy: Any, spec: Mapping[str, Any], predictor: Mapping[s
 def build_task_spec_program(dspy: Any, spec: Mapping[str, Any]) -> Any:
     """One dspy.Predict or dspy.ChainOfThought per predictor, as attributes named
     after the predictors, so DSPy names them "<name>" or "<name>.predict"."""
+    from dspy.utils.exceptions import AdapterParseError
+
     module_type = dspy.ChainOfThought if spec["module"] == "cot" else dspy.Predict
     predictors = [dict(predictor) for predictor in spec["predictors"]]
     input_keys = list(spec["inputs"])
+    members = {
+        name
+        for record_type in (dspy.Example, dspy.Prediction)
+        for name in dir(record_type)
+        if not name.startswith("_")
+    }
+    for key in [*input_keys, *(predictor["output"] for predictor in predictors)]:
+        if key in members:
+            raise TaskSpecError(f"task-spec-invalid: field name {key} is a dspy.Example or dspy.Prediction member")
 
     class TaskSpecProgram(dspy.Module):
         def __init__(self) -> None:
@@ -1505,9 +1547,35 @@ def build_task_spec_program(dspy: Any, spec: Mapping[str, Any]) -> Any:
             values = {key: inputs[key] for key in input_keys}
             outputs = {}
             for predictor in predictors:
-                result = getattr(self, predictor["name"])(**values)
-                outputs[predictor["output"]] = getattr(result, predictor["output"], None)
+                module = getattr(self, predictor["name"])
+                try:
+                    result = module(**values)
+                except AdapterParseError as error:
+                    # One predictor's unparseable answer (a label outside the
+                    # Literal, say) scores 0 for that predictor instead of failing
+                    # the row: a failed row reports no objective_scores, and GEPA's
+                    # objective frontiers average only the rows that report them.
+                    # Spend stops reach here as LM errors, never as parse errors.
+                    if spend_cause(error) is not None:
+                        raise
+                    outputs[predictor["output"]] = None
+                    self._trace_parse_failure(module, values, predictor["output"], error)
+                    continue
+                outputs[predictor["output"]] = field_value(result, predictor["output"])
             return dspy.Prediction(**outputs)
+
+        @staticmethod
+        def _trace_parse_failure(module: Any, values: Mapping[str, Any], output: str, error: Any) -> None:
+            # Predict records nothing when it raises, so GEPA would find no trace
+            # for this predictor and could not reflect on its format failures.
+            # Record the raw response the way Predict records a parsed one.
+            trace = dspy.settings.trace
+            if trace is None or dspy.settings.max_trace_size <= 0:
+                return
+            inner = module.predictors()[0]
+            if len(trace) >= dspy.settings.max_trace_size:
+                trace.pop(0)
+            trace.append((inner, dict(values), dspy.Prediction(**{output: getattr(error, "lm_response", None)})))
 
     return TaskSpecProgram()
 
@@ -1541,9 +1609,28 @@ def task_spec_component(
     match_mode: str,
     subject: str,
 ) -> tuple[float, str]:
-    """Score one predictor's output and explain it in the DSPy tutorial's style."""
+    """Score one predictor's output and explain it in the DSPy tutorial's style.
+
+    None means the predictor's answer could not be parsed (TaskSpecProgram turns
+    DSPy's AdapterParseError into None), which scores 0 with format feedback, as
+    the DSPy AIME tutorial's metric does for an answer that is not an integer.
+    """
     output = predictor["output"]
     kind = predictor["type"]["kind"]
+    if predicted is None:
+        if kind == "text":
+            return 0.0, (
+                f"Your {output} answer could not be parsed from your response. "
+                f"The expected {output} is {quoted(gold)}. Reply with the {output} field in the required format."
+            )
+        labels = predictor["type"]["labels"]
+        expected = quoted(repr(list(gold or []))) if kind == "label-set" else quoted(gold)
+        shape = "a list of the allowed labels" if kind == "label-set" else "one of the allowed labels"
+        return 0.0, (
+            f"Your {output} answer could not be parsed as {shape}: {quoted(repr(labels))}. "
+            f"The correct {output} is {expected}. Answer with labels copied exactly as listed, "
+            "with the same letter case and spelling, and nothing else."
+        )
     if kind == "label-set":
         labels = predictor["type"]["labels"]
         def norm(value: Any) -> str:
@@ -1613,8 +1700,8 @@ def task_spec_components(
     return {
         predictor["name"]: task_spec_component(
             predictor,
-            getattr(gold, predictor["output"], None),
-            getattr(prediction, predictor["output"], None),
+            field_value(gold, predictor["output"]),
+            field_value(prediction, predictor["output"]),
             match_mode,
             subject,
         )
@@ -1654,7 +1741,7 @@ def task_spec_predicted(spec: Mapping[str, Any], prediction: Any) -> dict[str, A
     """JSON-safe predicted outputs for the holdout artifact."""
     predicted: dict[str, Any] = {}
     for predictor in spec["predictors"]:
-        value = getattr(prediction, predictor["output"], None)
+        value = field_value(prediction, predictor["output"])
         if predictor["type"]["kind"] == "label-set":
             values = value if isinstance(value, (list, tuple, set)) else ([] if value is None else [value])
             predicted[predictor["output"]] = sorted(str(item).strip() for item in values)
@@ -2928,7 +3015,7 @@ def score_program_on_rows(
                 mode: sum(by_predictor[mode].values()) / len(predictor_names) for mode in MATCH_MODES
             }
         else:
-            predicted = {key: str(getattr(prediction, key, "")).strip() for key in output_keys}
+            predicted = {key: str(field_value(prediction, key, "")).strip() for key in output_keys}
             by_predictor = {mode: {} for mode in MATCH_MODES}
             by_match = {
                 mode: float(exact_match_feedback(output_keys, gold, prediction, mode).score)
