@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { join, relative, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
 import { DEFAULT_GATEWAY_URL } from "./config/defaults.js";
 import { readCredentials } from "./config/credentials.js";
@@ -237,6 +237,13 @@ const adapterRegistry: Record<string, UvAdapterSpec> = {
       if (taskSpec && options.module !== undefined && options.module !== taskSpec.module) {
         throw new Error(`--module ${options.module} differs from the task spec's module (${taskSpec.module})`);
       }
+      const trainSplit = options.trainSplit ?? "train";
+      const devSplit = options.devSplit ?? "dev";
+      requireDisjointSplits(trainSplit, devSplit);
+      const logDir = resolve(options.logDir ?? join(repo, optimizeDir, "dspy-gepa", "gepa-log"));
+      if (options.seedInstructions) {
+        rejectSeedInsideRunArtifacts(options.seedInstructions, [join(repo, optimizeDir), logDir]);
+      }
       const args = [
         "dspy-gepa",
         "--repo",
@@ -252,9 +259,9 @@ const adapterRegistry: Record<string, UvAdapterSpec> = {
         "--split-key",
         options.splitKey ?? "split",
         "--train-split",
-        options.trainSplit ?? "train",
+        trainSplit,
         "--dev-split",
-        options.devSplit ?? "dev",
+        devSplit,
         "--max-tokens",
         String(positiveInteger(options.maxTokens ?? "2048", "--max-tokens")),
         "--reflection-max-tokens",
@@ -285,7 +292,7 @@ const adapterRegistry: Record<string, UvAdapterSpec> = {
         "--seed",
         String(integer(options.seed ?? "0", "--seed")),
         "--log-dir",
-        resolve(options.logDir ?? join(repo, optimizeDir, "dspy-gepa", "gepa-log")),
+        logDir,
         "--track-stats",
         "true",
         ...searchArgs(options),
@@ -615,6 +622,39 @@ function searchArgs(options: AdapterRunOptions): string[] {
   }
   if (options.evaluateHoldout === true) args.push("--evaluate-holdout");
   return args;
+}
+
+// Holdout rows are matched case-insensitively and train/dev rows exactly, so a dev
+// split named "Holdout" would optimize on rows later reported as unseen. The
+// runtime re-checks this and asserts the rows are disjoint before any provider call.
+function requireDisjointSplits(trainSplit: string, devSplit: string): void {
+  if (trainSplit.toLowerCase() === "holdout" || devSplit.toLowerCase() === "holdout") {
+    throw new Error("--train-split and --dev-split must not name the holdout split");
+  }
+  if (trainSplit === devSplit) {
+    throw new Error("--train-split and --dev-split must differ");
+  }
+}
+
+// The seed is bound by content hash, and a run rewrites best-so-far.json,
+// candidate.json and its log dir, so seeding from them would break resuming.
+function rejectSeedInsideRunArtifacts(seedInput: string, ownedDirs: string[]): void {
+  const real = (path: string): string => {
+    try {
+      return realpathSync(path);
+    } catch {
+      return resolve(path);
+    }
+  };
+  const seed = real(seedInput);
+  for (const dir of ownedDirs.map(real)) {
+    const rel = relative(dir, seed);
+    if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
+      throw new Error(
+        "--seed-instructions must not point inside .understudy/optimize-workload or the --log-dir, which the run rewrites; copy the file elsewhere first",
+      );
+    }
+  }
 }
 
 const secretKeyPattern =/(?:^|[_-])(api[_-]?key|authorization|password|secret|token)(?:$|[_-])/i;

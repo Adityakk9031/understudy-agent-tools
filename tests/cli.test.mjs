@@ -997,6 +997,9 @@ function writeDspyGepaProgramBridge(
     worldStateChanged = true,
     validOracle = true,
     reflectionPromptTokens = 1200,
+    // Python expressions for each gate's output room; by default the run's caps.
+    studentGateMaxTokens = 'context["config"]["inference"]["max_tokens"]',
+    reflectionGateMaxTokens = 'context["config"]["inference"]["reflection_max_tokens"]',
     mutationClaimed = true,
     validRouteBinding = true,
     validInputBundleBinding = true,
@@ -1086,7 +1089,7 @@ def admit_understudy_dspy_gepa(context):
                 "source_prompt_sha256": "${"9".repeat(64)}",
                 "token_count_receipt_sha256": "${"0".repeat(64)}",
                 "source_prompt_tokens": 1000,
-                "max_tokens": 256,
+                "max_tokens": ${studentGateMaxTokens},
                 "safety_margin": 128,
                 "source_context_limit": 4096,
                 "renderer": {"id": "fixture-renderer", "sha256": "${"f".repeat(64)}"},
@@ -1112,7 +1115,7 @@ def admit_understudy_dspy_gepa(context):
                 "reflection_prompt_sha256": "${"3".repeat(64)}",
                 "token_count_receipt_sha256": "${"4".repeat(64)}",
                 "reflection_prompt_tokens": ${reflectionPromptTokens},
-                "max_tokens": 256,
+                "max_tokens": ${reflectionGateMaxTokens},
                 "safety_margin": 128,
                 "reflection_context_limit": 8192,
                 "renderer": {"id": "fixture-reflection-renderer", "sha256": "${"5".repeat(64)}"},
@@ -2345,6 +2348,8 @@ class ChainOfThought(Predict):
       const badBridgePath = join(repo, "bad-program-bridge.py");
       const badOracleBridgePath = join(repo, "bad-oracle-program-bridge.py");
       const reflectionOverflowBridgePath = join(repo, "reflection-overflow-program-bridge.py");
+      const shortGateBridgePath = join(repo, "short-gate-program-bridge.py");
+      const shortStudentGateBridgePath = join(repo, "short-student-gate-program-bridge.py");
       const badRouteBridgePath = join(repo, "bad-route-program-bridge.py");
       const badInputBundleBridgePath = join(repo, "bad-input-bundle-program-bridge.py");
       const badEndpointBundleBridgePath = join(repo, "bad-endpoint-bundle-program-bridge.py");
@@ -2359,8 +2364,11 @@ class ChainOfThought(Predict):
       writeDspyGepaProgramBridge(bridgePath);
       writeDspyGepaProgramBridge(badBridgePath, { worldStateChanged: false });
       writeDspyGepaProgramBridge(badOracleBridgePath, { validOracle: false });
-      // Equality fails closed: 7808 + 256 + 128 == 8192.
-      writeDspyGepaProgramBridge(reflectionOverflowBridgePath, { reflectionPromptTokens: 7808 });
+      // Equality fails closed: 6016 + 2048 (the reflection cap) + 128 == 8192.
+      writeDspyGepaProgramBridge(reflectionOverflowBridgePath, { reflectionPromptTokens: 6016 });
+      // A gate sized for 256 output tokens proves nothing about a 2048-token reflection cap.
+      writeDspyGepaProgramBridge(shortGateBridgePath, { reflectionGateMaxTokens: "256" });
+      writeDspyGepaProgramBridge(shortStudentGateBridgePath, { studentGateMaxTokens: "128" });
       writeDspyGepaProgramBridge(badRouteBridgePath, { validRouteBinding: false });
       writeDspyGepaProgramBridge(badInputBundleBridgePath, { validInputBundleBinding: false });
       writeDspyGepaProgramBridge(badEndpointBundleBridgePath, { validEndpointBundleBinding: false });
@@ -2642,6 +2650,26 @@ class ChainOfThought(Predict):
       const reflectionOverflow = spawnSync("python3", reflectionOverflowArgs, { encoding: "utf8", env: runtimeEnv });
       assert.equal(reflectionOverflow.status, 6, reflectionOverflow.stderr || reflectionOverflow.stdout);
       assert.equal(JSON.parse(reflectionOverflow.stdout).reason, "reflection-renderer-context-window-overflow");
+      assert.equal(existsSync(modelSentinel), false);
+
+      const shortGateArgs = [...runtimeArgs, "--admission-only"];
+      shortGateArgs[shortGateArgs.indexOf(bridgePath)] = shortGateBridgePath;
+      shortGateArgs[shortGateArgs.indexOf(logDir)] = `${logDir}-short-gate`;
+      const shortGate = spawnSync("python3", shortGateArgs, { encoding: "utf8", env: runtimeEnv });
+      assert.equal(shortGate.status, 6, shortGate.stderr || shortGate.stdout);
+      assert.equal(
+        JSON.parse(shortGate.stdout).reason,
+        "reflection-context-window-gate-max-tokens-below-reflection-cap",
+      );
+      assert.equal(existsSync(modelSentinel), false);
+      // The student gate is held to the student cap the same way: 128 covers --max-tokens 128, not 256.
+      const shortStudentArgs = [...runtimeArgs, "--admission-only"];
+      shortStudentArgs[shortStudentArgs.indexOf(bridgePath)] = shortStudentGateBridgePath;
+      shortStudentArgs[shortStudentArgs.indexOf(logDir)] = `${logDir}-short-student-gate`;
+      shortStudentArgs[shortStudentArgs.indexOf("--max-tokens") + 1] = "256";
+      const shortStudent = spawnSync("python3", shortStudentArgs, { encoding: "utf8", env: runtimeEnv });
+      assert.equal(shortStudent.status, 6, shortStudent.stderr || shortStudent.stdout);
+      assert.equal(JSON.parse(shortStudent.stdout).reason, "source-context-window-gate-max-tokens-below-student-cap");
       assert.equal(existsSync(modelSentinel), false);
 
       const badRouteArgs = [...runtimeArgs, "--admission-only"];

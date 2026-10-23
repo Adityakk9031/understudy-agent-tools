@@ -542,6 +542,9 @@ print(json.dumps({
   it("rejects contradictory or malformed spend and search flags before touching auth", () =>
     withRepo(({ repo, samplesPath }) => {
       const prices = ["--input-usd-per-million", "1", "--output-usd-per-million", "2"];
+      const seedInsideRun = join(runDir(repo), "best-so-far.json");
+      mkdirSync(runDir(repo), { recursive: true });
+      writeFileSync(seedInsideRun, JSON.stringify({ instructions: { predict: "x" } }));
       const cases = [
         [["--no-spend-ledger", "--budget-usd", "1"], /cannot be combined with --no-spend-ledger/],
         [["--budget-usd", "1", "--model-price", "synthetic-deployment=oops"], /--model-price must look like/],
@@ -553,6 +556,11 @@ print(json.dumps({
         [["--budget-usd", "1", ...prices, "--rounds", "0"], /--rounds must be a positive integer/],
         [["--budget-usd", "1", ...prices, "--max-minutes", "-1"], /--max-minutes must be a positive number/],
         [["--budget-usd", "1", ...prices, "--seed-instructions", join(repo, "missing.json")], /--seed-instructions must point to an existing regular file/],
+        [["--budget-usd", "1", ...prices, "--seed-instructions", seedInsideRun], /--seed-instructions must not point inside \.understudy\/optimize-workload or the --log-dir/],
+        [["--budget-usd", "1", ...prices, "--seed-instructions", samplesPath, "--log-dir", repo], /--seed-instructions must not point inside/],
+        [["--budget-usd", "1", ...prices, "--dev-split", "Holdout"], /--train-split and --dev-split must not name the holdout split/],
+        [["--budget-usd", "1", ...prices, "--train-split", "holdout"], /--train-split and --dev-split must not name the holdout split/],
+        [["--budget-usd", "1", ...prices, "--train-split", "dev"], /--train-split and --dev-split must differ/],
       ];
       for (const [extra, pattern] of cases) {
         const result = run([...cliBase(repo, samplesPath), ...extra]);
@@ -736,6 +744,103 @@ print(json.dumps({
       assert.deepEqual(seen.claimed, ["reflection"]);
       assert.deepEqual(seen.no_gateway, []);
       assert.deepEqual(seen.bad_gateway, []);
+    }));
+});
+
+describe("dspy-gepa splits, seeds and fixed-path artifacts", () => {
+  it("refuses a train or dev split that names the holdout, or a dev split equal to train", { skip: !pythonAvailable }, () =>
+    withRepo(({ repo }) => {
+      const samples = writeSamples(repo, "holdout-samples.json", holdoutRows());
+      for (const [extra, reason] of [
+        [["--dev-split", "holdout"], "split-invalid: --train-split and --dev-split must not name the holdout split"],
+        [["--dev-split", "Holdout", "--evaluate-holdout"], "split-invalid: --train-split and --dev-split must not name the holdout split"],
+        [["--train-split", "HOLDOUT"], "split-invalid: --train-split and --dev-split must not name the holdout split"],
+        [["--train-split", "dev"], "split-invalid: --train-split and --dev-split must differ"],
+      ]) {
+        const bad = runDspyGepa(mkdtempSync(join(repo, "bad-")), samples, extra);
+        assert.equal(bad.result.status, 3, `${extra.join(" ")}: ${bad.result.stderr}`);
+        assert.equal(bad.payload().reason, reason, extra.join(" "));
+        assert.equal(bad.payload().provider_calls, false);
+        assert.equal(existsSync(bad.sentinel), false, `${extra.join(" ")} reached the provider`);
+      }
+      const { runtime } = runDspyGepa(mkdtempSync(join(repo, "ok-")), samples);
+      const overlap = runtimeScript(runtime, `
+row = {"split": "holdout"}
+try:
+    rt.require_disjoint_holdout([row], [row])
+    print(json.dumps("disjoint"))
+except rt.SplitError as error:
+    print(json.dumps(str(error)))
+`);
+      assert.equal(overlap, "split-invalid: holdout rows overlap the train or dev rows");
+    }));
+
+  it("refuses a seed the run itself rewrites, and resumes the identical command from a copied seed", { skip: !pythonAvailable }, () =>
+    withRepo(({ repo, samplesPath }) => {
+      const first = runDspyGepa(repo, samplesPath);
+      assert.equal(first.result.status, 0, first.result.stderr);
+      const bestPath = join(runDir(repo), "best-so-far.json");
+      const logSeed = join(repo, "custom-log", "seed.json");
+      mkdirSync(join(repo, "custom-log"));
+      writeFileSync(logSeed, readFileSync(bestPath));
+      for (const extra of [
+        ["--seed-instructions", bestPath],
+        ["--seed-instructions", join(optimizeDir(repo), "candidate.json")],
+        ["--seed-instructions", logSeed, "--log-dir", join(repo, "custom-log")],
+      ]) {
+        const refused = runDspyGepa(repo, samplesPath, extra);
+        assert.equal(refused.result.status, 3, refused.result.stderr);
+        assert.match(refused.payload().reason, /^seed-instructions-inside-run-artifacts: copy the seed file out of/);
+        assert.equal(refused.payload().provider_calls, false);
+      }
+      const seed = join(repo, "seed.json");
+      writeFileSync(seed, readFileSync(bestPath));
+      const seededArgs = ["--seed-instructions", seed, "--log-dir", join(repo, "seeded-log")];
+      const seeded = runDspyGepa(repo, samplesPath, seededArgs);
+      assert.equal(seeded.result.status, 0, seeded.result.stderr);
+      // The run rewrote best-so-far.json, but the copied seed is unchanged, so the
+      // identical command resumes instead of stopping with resume-log-config-mismatch.
+      const resumed = runDspyGepa(repo, samplesPath, seededArgs);
+      assert.equal(resumed.result.status, 0, resumed.result.stderr);
+      assert.equal(resumed.payload().config_sha256, seeded.payload().config_sha256);
+    }));
+
+  it("never lists an earlier run's holdout evaluation or best-so-far as this run's", { skip: !pythonAvailable }, () =>
+    withRepo(({ repo }) => {
+      const samples = writeSamples(repo, "holdout-samples.json", holdoutRows());
+      const holdoutPath = join(runDir(repo), "holdout-evaluation.json");
+      const bestPath = join(runDir(repo), "best-so-far.json");
+      const first = runDspyGepa(repo, samples, ["--evaluate-holdout", "--log-dir", join(repo, "log-1")], {}, roomySpendArgs);
+      assert.equal(first.result.status, 0, first.result.stderr);
+      assert.equal(first.payload().artifacts.holdout_evaluation_path, ".understudy/optimize-workload/dspy-gepa/holdout-evaluation.json");
+      const firstBest = readJson(bestPath);
+      assert.equal(firstBest.config_sha256, first.payload().config_sha256);
+      assert.equal(typeof firstBest.run_id, "string");
+
+      // A later run without --evaluate-holdout: the old evaluation is gone and unlisted,
+      // and the other config's best-so-far was cleared before this run's was written.
+      const secondArgs = ["--log-dir", join(repo, "log-2")];
+      const second = runDspyGepa(repo, samples, secondArgs, {}, roomySpendArgs);
+      assert.equal(second.result.status, 0, second.result.stderr);
+      assert.equal(existsSync(holdoutPath), false);
+      assert.equal("holdout_evaluation_path" in second.payload().artifacts, false);
+      assert.equal(readJson(bestPath).config_sha256, second.payload().config_sha256);
+      const runIds = () => [...new Set(readEvents(repo).events.map((event) => event.run_id))];
+      const clearedIn = (runId) => readEvents(repo).events.some((event) => event.run_id === runId && event.event === "best-so-far-cleared");
+      assert.equal(clearedIn(runIds().at(-1)), true);
+
+      // Resuming the same config keeps its best-so-far.
+      const resumed = runDspyGepa(repo, samples, secondArgs, {}, roomySpendArgs);
+      assert.equal(resumed.result.status, 0, resumed.result.stderr);
+      assert.equal(clearedIn(runIds().at(-1)), false);
+
+      // A run that fails before optimizing lists neither fixed-path file.
+      writeFileSync(holdoutPath, JSON.stringify({ stale: true }));
+      const failed = runDspyGepa(repo, samples, ["--log-dir", join(repo, "log-3"), "--dev-split", "holdout"], {}, roomySpendArgs);
+      assert.equal(failed.result.status, 3, failed.result.stderr);
+      assert.equal(existsSync(bestPath), true);
+      assert.equal("holdout_evaluation_path" in failed.payload().artifacts, false);
+      assert.equal("best_so_far_path" in failed.payload().artifacts, false);
     }));
 });
 

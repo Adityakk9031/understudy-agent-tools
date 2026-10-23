@@ -262,6 +262,17 @@ uses semantic-ish versioning (minor = new skill or new capability, patch = fixes
   candidates that fail most rows. Spec rows are validated before the gateway
   price lookup. The docs now say `--match-mode` applies to `text` predictors
   only.
+- **`dspy-gepa` keeps the holdout unseen and its artifacts honest.** A train or
+  dev split naming the holdout (`--dev-split Holdout`), or equal train and dev
+  splits, is refused in the CLI and the runtime, which also asserts holdout rows
+  are disjoint from train and dev before any provider call. A seed inside
+  `.understudy/optimize-workload/` or the `--log-dir` is refused, since the run
+  rewrites it and the identical command could never resume; copy it out first.
+  `holdout-evaluation.json` is removed when optimizing starts and listed only
+  when this run wrote it, and `best-so-far.json` now carries `run_id` and
+  `config_sha256` and is removed unless it belongs to the same config. A
+  bridge's context-window gate must report `max_tokens` at least the run's
+  student or reflection output cap.
 - **Honest backend readiness for the same training plan.** Compiling a portable
   plan no longer claims a backend can run a recipe it has no executor for:
   `adapter_implemented` now comes from the local MLX and Tinker executor

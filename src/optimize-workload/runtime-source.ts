@@ -308,10 +308,17 @@ class RunEvents:
 class GepaProgress:
     """GEPA 0.1.4 callbacks (every method optional) that stream optimizer progress."""
 
-    def __init__(self, events: RunEvents, best_path: Path | None, round_index: int = 1) -> None:
+    def __init__(
+        self,
+        events: RunEvents,
+        best_path: Path | None,
+        round_index: int = 1,
+        config_sha256: str | None = None,
+    ) -> None:
         self._events = events
         self._best_path = best_path
         self._round = round_index
+        self._config_sha256 = config_sha256
 
     def on_optimization_start(self, event: dict[str, Any]) -> None:
         self._events.emit(
@@ -348,6 +355,8 @@ class GepaProgress:
             write_owner_only_json(self._best_path, {
                 "schema_version": "understudy.dspy_gepa_best_so_far.v1",
                 "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "run_id": self._events.run_id,
+                "config_sha256": self._config_sha256,
                 "round": self._round,
                 "iteration": event.get("iteration"),
                 "candidate_idx": event.get("candidate_idx"),
@@ -1202,11 +1211,41 @@ def fetch_gateway_prices(
     return prices, {"status": status, "models_listed": len(items), "models_priced": sorted(prices)}
 
 
+class ReportableInputError(ValueError):
+    """Invalid runtime input whose message names flags only, never row content or
+    paths, so it is safe to report as the failure reason."""
+
+
+class SplitError(ReportableInputError):
+    """A train/dev/holdout split that would let holdout rows drive optimization."""
+
+
+def is_holdout_split(value: Any) -> bool:
+    return str(value).casefold() == "holdout"
+
+
+def validate_split_names(train_split: str, dev_split: str) -> None:
+    # Holdout rows are matched case-insensitively, train and dev rows exactly, so a
+    # dev split named Holdout would optimize on the rows later reported as unseen.
+    if is_holdout_split(train_split) or is_holdout_split(dev_split):
+        raise SplitError("split-invalid: --train-split and --dev-split must not name the holdout split")
+    if train_split == dev_split:
+        raise SplitError("split-invalid: --train-split and --dev-split must differ")
+
+
+def require_disjoint_holdout(holdout: list[Any], used: list[Any]) -> None:
+    """Assert by row identity that no holdout row is a train or dev row."""
+    used_ids = {id(row) for row in used}
+    if any(id(row) in used_ids for row in holdout):
+        raise SplitError("split-invalid: holdout rows overlap the train or dev rows")
+
+
 def split_train_dev(rows: list[dict[str, Any]], split_key: str, train_split: str, dev_split: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    validate_split_names(train_split, dev_split)
     if any(split_key in row for row in rows):
         train = [row for row in rows if str(row.get(split_key)) == train_split]
         dev = [row for row in rows if str(row.get(split_key)) == dev_split]
-        holdout_count = len([row for row in rows if str(row.get(split_key)).lower() == "holdout"])
+        holdout_count = len([row for row in rows if is_holdout_split(row.get(split_key))])
     else:
         train = rows[:1]
         dev = rows[1:] or rows[:1]
@@ -1221,7 +1260,7 @@ def split_train_dev(rows: list[dict[str, Any]], split_key: str, train_split: str
 def holdout_rows_for(rows: list[dict[str, Any]], split_key: str) -> list[dict[str, Any]]:
     if not any(split_key in row for row in rows):
         return []
-    return [row for row in rows if str(row.get(split_key)).lower() == "holdout"]
+    return [row for row in rows if is_holdout_split(row.get(split_key))]
 
 
 MATCH_MODES = ("exact", "case-insensitive")
@@ -1788,10 +1827,14 @@ def dspy_artifacts(args: argparse.Namespace) -> dict[str, str]:
         "best_so_far_path": dspy_best_so_far_path(args),
         "holdout_evaluation_path": dspy_holdout_evaluation_path(args),
     }
+    # These fixed paths may hold an earlier run's file; list them only once this
+    # run has cleared or written them.
+    owned = getattr(args, "owned_artifacts", set())
     return {
         name: artifact_path(repo, path)
         for name, path in paths.items()
-        if path.exists() or name in {"package_state_path", "config_path", "run_state_path"}
+        if (path.exists() and (name not in {"best_so_far_path", "holdout_evaluation_path"} or name in owned))
+        or name in {"package_state_path", "config_path", "run_state_path"}
     }
 
 
@@ -1948,6 +1991,8 @@ def validate_context_window_gate(
     prompt_tokens_field: str,
     context_limit_field: str,
     overflow_reason: str,
+    required_max_tokens: int | None = None,
+    max_tokens_reason: str = "context-window-gate-max-tokens-below-run-cap",
 ) -> None:
     if not isinstance(gate, Mapping):
         raise WorkloadAdmissionError("bundle-validation-requires-context-window-gate")
@@ -1972,6 +2017,10 @@ def validate_context_window_gate(
         numeric[field] = value
     if numeric["max_tokens"] <= 0 or numeric[context_limit_field] <= 0:
         raise WorkloadAdmissionError("context-window-gate-has-invalid-limits")
+    # The gate proves the prompt fits with max_tokens of output room; a smaller
+    # value than the run's bound output cap for that role proves nothing.
+    if required_max_tokens is not None and numeric["max_tokens"] < required_max_tokens:
+        raise WorkloadAdmissionError(max_tokens_reason)
     if (
         numeric[prompt_tokens_field]
         + numeric["max_tokens"]
@@ -2190,6 +2239,8 @@ def run_bridge_admission(module: Any, context: dict[str, Any]) -> dict[str, Any]
         prompt_tokens_field="source_prompt_tokens",
         context_limit_field="source_context_limit",
         overflow_reason="source-renderer-context-window-overflow",
+        required_max_tokens=int(config["inference"]["max_tokens"]),
+        max_tokens_reason="source-context-window-gate-max-tokens-below-student-cap",
     )
     validate_context_window_gate(
         validation.get("reflection_context_window_gate"),
@@ -2197,6 +2248,8 @@ def run_bridge_admission(module: Any, context: dict[str, Any]) -> dict[str, Any]
         prompt_tokens_field="reflection_prompt_tokens",
         context_limit_field="reflection_context_limit",
         overflow_reason="reflection-renderer-context-window-overflow",
+        required_max_tokens=int(config["inference"]["reflection_max_tokens"]),
+        max_tokens_reason="reflection-context-window-gate-max-tokens-below-reflection-cap",
     )
     runtime_routes = config.get("inference", {}).get("routes")
     if not isinstance(runtime_routes, Mapping):
@@ -2801,8 +2854,19 @@ def validate_search_options(args: argparse.Namespace) -> None:
         seed = Path(args.seed_instructions)
         if not seed.is_file() or seed.is_symlink():
             raise ValueError("--seed-instructions file does not exist")
+        # The seed is bound by content hash, and this run rewrites best-so-far.json,
+        # candidate.json and everything else under its artifact and log dirs, so a
+        # seed read from there would stop the identical command from resuming.
+        resolved_seed = seed.resolve()
+        for owned in (dspy_run_dir(args).parent, Path(args.log_dir)):
+            if resolved_seed.is_relative_to(owned.resolve()):
+                raise ReportableInputError(
+                    "seed-instructions-inside-run-artifacts: copy the seed file out of "
+                    ".understudy/optimize-workload and the --log-dir before seeding from it"
+                )
     if args.frontier_type not in FRONTIER_TYPES:
         raise ValueError("--frontier-type must be instance, objective, hybrid, or cartesian")
+    validate_split_names(args.train_split, args.dev_split)
     args.task_spec_data = None
     if args.task_spec:
         if args.program_bridge:
@@ -2871,6 +2935,7 @@ def build_gepa_search_kwargs(
     stop_file: Path,
     best_path: Path,
     round_index: int,
+    config_sha256: str | None = None,
 ) -> dict[str, Any]:
     """dspy.GEPA keyword arguments for callbacks, stoppers and proposal strategy."""
     from gepa.utils.stop_condition import (
@@ -2891,7 +2956,7 @@ def build_gepa_search_kwargs(
         stoppers.append(TimeoutStopCondition(float(args.max_minutes) * 60))
     inner: dict[str, Any] = {
         "use_cloudpickle": True,
-        "callbacks": [GepaProgress(events, best_path, round_index)],
+        "callbacks": [GepaProgress(events, best_path, round_index, config_sha256)],
         "stop_callbacks": stoppers,
     }
     if args.frontier_type != "instance":
@@ -3223,9 +3288,37 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
     import dspy
 
     task_spec: dict[str, Any] | None = getattr(args, "task_spec_data", None)
-    # Samples load before any network access, so a task spec can reject a bad
-    # gold value before the gateway or a provider is contacted.
+    # Samples load and splits are checked before any network access, so a bad
+    # split or (with a task spec) a bad gold value stops the run before the
+    # gateway price lookup or any provider call.
     rows = load_rows(args.samples) if args.samples else []
+    input_keys = split_keys(args.input_keys or "")
+    output_keys = split_keys(args.output_keys or "")
+    if program_bridge_path is None:
+        if not rows or not input_keys or not output_keys:
+            raise ValueError("samples, input keys, and output keys are required without a program bridge")
+        train_rows, dev_rows, holdout_count = split_train_dev(
+            rows, args.split_key, args.train_split, args.dev_split,
+        )
+    else:
+        train_rows = []
+        dev_rows = []
+        holdout_count = len([row for row in rows if is_holdout_split(row.get(args.split_key, ""))])
+    # Holdout rows are loaded only for the opt-in evaluation that runs after the
+    # candidate is frozen; they never reach GEPA, the metric, or a stopper.
+    holdout_rows = holdout_rows_for(rows, args.split_key) if args.evaluate_holdout else []
+    require_disjoint_holdout(holdout_rows_for(rows, args.split_key), [*train_rows, *dev_rows])
+    if args.evaluate_holdout:
+        if not holdout_rows:
+            raise ValueError(f"--evaluate-holdout needs rows with {args.split_key}=holdout")
+        for row in holdout_rows:
+            missing = [key for key in [*input_keys, *output_keys] if key not in row]
+            if missing and task_spec is None:
+                raise ValueError("holdout row is missing keys")
+    if task_spec is not None:
+        validate_task_spec_rows(task_spec, rows, [*train_rows, *dev_rows, *holdout_rows])
+    events.emit("data-loaded", train=len(train_rows), dev=len(dev_rows), holdout=holdout_count)
+
     gateway_url = os.environ.get("UNDERSTUDY_GATEWAY_URL")
     student_route, student_api_key, student_api_base = resolve_lm_route(
         "student", args.model, bridge_config, gateway_url,
@@ -3259,36 +3352,7 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
             if ledger.prices_for(route["requested_model"], role) is None:
                 raise ValueError(f"no price basis for the {role} model")
 
-    input_keys = split_keys(args.input_keys or "")
-    output_keys = split_keys(args.output_keys or "")
     bridge_module = load_program_bridge(program_bridge_path) if program_bridge_path else None
-
-    if bridge_module is None:
-        if not rows or not input_keys or not output_keys:
-            raise ValueError("samples, input keys, and output keys are required without a program bridge")
-        train_rows, dev_rows, holdout_count = split_train_dev(
-            rows, args.split_key, args.train_split, args.dev_split,
-        )
-    else:
-        train_rows = []
-        dev_rows = []
-        holdout_count = len([
-            row for row in rows
-            if str(row.get(args.split_key, "")).lower() == "holdout"
-        ])
-    # Holdout rows are loaded only for the opt-in evaluation that runs after the
-    # candidate is frozen; they never reach GEPA, the metric, or a stopper.
-    holdout_rows = holdout_rows_for(rows, args.split_key) if args.evaluate_holdout else []
-    if args.evaluate_holdout:
-        if not holdout_rows:
-            raise ValueError(f"--evaluate-holdout needs rows with {args.split_key}=holdout")
-        for row in holdout_rows:
-            missing = [key for key in [*input_keys, *output_keys] if key not in row]
-            if missing and task_spec is None:
-                raise ValueError("holdout row is missing keys")
-    if task_spec is not None:
-        validate_task_spec_rows(task_spec, rows, [*train_rows, *dev_rows, *holdout_rows])
-    events.emit("data-loaded", train=len(train_rows), dev=len(dev_rows), holdout=holdout_count)
 
     config_base = {
         "schema_version": "understudy.dspy_gepa_config.v2",
@@ -3645,6 +3709,20 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
         # A stale STOP from an earlier run must not end this one.
         stop_file.unlink()
         events.emit("stop-file-cleared")
+    # Fixed-path artifacts from an earlier run must not pass for this run's. The
+    # holdout evaluation is rescored each run; best-so-far survives only a resume
+    # of the same config, which keeps the best its earlier attempt found.
+    dspy_holdout_evaluation_path(args).unlink(missing_ok=True)
+    best_path = dspy_best_so_far_path(args)
+    if best_path.exists():
+        try:
+            prior_best = json.loads(best_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            prior_best = None
+        if not isinstance(prior_best, dict) or prior_best.get("config_sha256") != config_sha256:
+            best_path.unlink()
+            events.emit("best-so-far-cleared")
+    args.owned_artifacts = {"best_so_far_path"}
     args.phase = "optimizing"
     write_dspy_run_state(args, ledger, "running", None, {"config_sha256": config_sha256}, phase="optimizing")
     events.emit("phase", name="optimizing", max_metric_calls=args.max_metric_calls, rounds=args.rounds)
@@ -3668,7 +3746,9 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
             track_stats=args.track_stats,
             track_best_outputs=True,
             seed=args.seed,
-            **build_gepa_search_kwargs(args, events, stop_file, dspy_best_so_far_path(args), round_index),
+            **build_gepa_search_kwargs(
+                args, events, stop_file, dspy_best_so_far_path(args), round_index, config_sha256,
+            ),
         )
         events.emit("round-started", round=round_index, of=args.rounds)
         optimized = teleprompter.compile(program_to_climb, trainset=trainset, valset=valset)
@@ -3827,6 +3907,7 @@ def _dspy_gepa_execute(args: argparse.Namespace, ledger: SpendLedger) -> None:
         holdout_evaluation["candidate_sha256"] = candidate_sha256
         holdout_evaluation["config_sha256"] = config_sha256
         write_owner_only_json(holdout_path, holdout_evaluation)
+        args.owned_artifacts.add("holdout_evaluation_path")
 
     spend_evidence = sampled_spend_evidence()
     proof = {
@@ -3943,8 +4024,9 @@ def dspy_gepa(args: argparse.Namespace) -> None:
         validate_search_options(args)
         if args.no_spend_ledger and args.program_bridge:
             raise ValueError("--no-spend-ledger is not supported with --program-bridge")
-    except TaskSpecError as error:
-        # Spec errors name a spec path, predictor or row index, never row content.
+    except (TaskSpecError, ReportableInputError) as error:
+        # Spec errors name a spec path, predictor or row index, never row content;
+        # the others name flags.
         emit_dspy_failure(args, ledger, "error", str(error), 3)
     except ValueError:
         emit_dspy_failure(args, ledger, "error", "invalid-runtime-input", 3)
@@ -3997,7 +4079,7 @@ def dspy_gepa(args: argparse.Namespace) -> None:
             emit_dspy_failure(args, ledger, "admission-blocked", str(error), 6)
         elif isinstance(error, UnsupportedTeacherError):
             emit_dspy_failure(args, ledger, "error", str(error), 3)
-        elif isinstance(error, TaskSpecError):
+        elif isinstance(error, (TaskSpecError, ReportableInputError)):
             emit_dspy_failure(args, ledger, "error", str(error), 3)
         elif isinstance(error, ImportError):
             emit_dspy_failure(args, ledger, "error", "runtime-dependency-error", 3)

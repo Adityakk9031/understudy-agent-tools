@@ -30,11 +30,11 @@ All paths are under `.understudy/optimize-workload/` and owner-only.
 |---|---|---|
 | `dspy-gepa/events.jsonl` | Continuously, flushed per event, appended per invocation | Every provider call, phase, GEPA candidate event, and holdout progress, tagged with a `run_id` |
 | `dspy-gepa/run-state.json` | At every phase change (`status: running`), then at the end | `status`, `phase`, and the spend ledger so far |
-| `dspy-gepa/best-so-far.json` | Each time a new best clears the full dev split | The best instruction text and its dev score |
+| `dspy-gepa/best-so-far.json` | Each time a new best clears the full dev split | The best instruction text and its dev score, with the `run_id` and `config_sha256` that produced it. A run with another config removes it before optimizing; a resume of the same config keeps it |
 | `dspy-gepa/config.json`, `package-state.json` | Before the first call | The hash-bound run config (including search settings and resolved prices) and package receipts |
 | `dspy-gepa/gepa-log/` | During optimization | GEPA's resumable state, bound to the config hash; round N of a climb uses `gepa-log/round-N` |
 | `candidate.json` | After optimization, before any holdout row is scored | Baseline and optimized instructions, `instructions_changed`, `gepa_stats`, `rounds`, `search` settings, spend evidence |
-| `dspy-gepa/holdout-evaluation.json` | With `--evaluate-holdout`, after `candidate.json` is frozen | Baseline vs optimized holdout scores, bound to `candidate_sha256` and `config_sha256` |
+| `dspy-gepa/holdout-evaluation.json` | With `--evaluate-holdout`, after `candidate.json` is frozen | Baseline vs optimized holdout scores, bound to `candidate_sha256` and `config_sha256`. Removed when optimizing starts, so an earlier run's file never stands in for this one |
 | `proof-packet.json` | At the end | Gate evidence and the holdout summary; `holdout_accessed_during_optimization` stays `false` |
 
 A run that dies leaves `events.jsonl`, `run-state.json`, `best-so-far.json`
@@ -45,9 +45,21 @@ and the GEPA log behind. Two ways back:
   still matches; any change stops with `resume-log-config-mismatch` before a
   provider call. The resumed GEPA keeps its own metric-call count, while the
   spend ledger and its cap start fresh for the new invocation.
-- **Warm start**: start a new run (new `--log-dir`, or a changed config) from
-  the best prompt with `--seed-instructions
-  .understudy/optimize-workload/dspy-gepa/best-so-far.json`.
+- **Warm start**: copy the best prompt out of the run's artifacts, then start a
+  new run from it with a new `--log-dir` (a changed config under an existing
+  log dir, including the default one, is always refused):
+
+  ```bash
+  cp .understudy/optimize-workload/dspy-gepa/best-so-far.json seeds/round-1.json
+  understudy optimize-workload adapter run ... --seed-instructions seeds/round-1.json \
+    --log-dir .understudy/optimize-workload/dspy-gepa/gepa-log-round-2
+  ```
+
+  The seed is bound by content hash, and the run rewrites `best-so-far.json`,
+  `candidate.json`, and its log dir, so a seed inside
+  `.understudy/optimize-workload/` or the `--log-dir` is refused
+  (`seed-instructions-inside-run-artifacts`): seeding from it directly would
+  stop the identical command from ever resuming.
 
 ## Features and the flags that enable them
 
@@ -68,13 +80,19 @@ and the GEPA log behind. Two ways back:
 | Parent selection | `--candidate-selection-strategy pareto\|current_best` | pareto | `current_best` is greedy and climbs faster on easy tasks; `pareto` keeps diverse parents |
 | Merge | `--use-merge` | off | Lets GEPA combine strong candidates |
 | `InstructionProposer` (3.4.1 default proposer) | `--proposer-skill PATH` (repeatable), `--proposer-note TEXT`, `--proposer-max-chars N` | none | Give the reflector domain guidance (a file, or a directory containing `SKILL.md`; bound by content hash), extra rules for every proposal, and a hard length limit so prompts do not bloat |
-| Warm start | `--seed-instructions PATH` | none | Start from a previous run's `best-so-far.json`, `candidate.json`, a `{predictor: text}` JSON file, or plain text. The unseeded student stays the holdout baseline |
+| Warm start | `--seed-instructions PATH` | none | Start from a copy of a previous run's `best-so-far.json` or `candidate.json` (kept outside `.understudy/optimize-workload/` and the `--log-dir`), a `{predictor: text}` JSON file, or plain text. The unseeded student stays the holdout baseline |
 | Climb rounds | `--rounds N`, `--min-round-gain G` | 1, 0 | Restart GEPA from the previous round's best prompt; stop when a round gains no more than G on the dev split, or reaches a perfect dev score |
 | Holdout evaluation | `--evaluate-holdout` | off | Scores baseline and optimized once on the holdout, after the candidate is frozen. Always reports exact and case-insensitive scores (`by_match`) |
-| Label comparison | `--match-mode exact\|case-insensitive` | exact | `case-insensitive` also ignores repeated whitespace. In `exact` mode the feedback tells the reflector when a miss "differs only in letter case" |
+| Label comparison | `--match-mode exact\|case-insensitive` | exact | `case-insensitive` also ignores repeated whitespace. In `exact` mode the feedback tells the reflector when a miss "differs only in letter case". With `--task-spec` it applies to `text` predictors only: `label` and `label-set` answers are parsed exactly against their `Literal` |
 | Multi-predictor programs, typed `Literal` outputs, per-predictor feedback | `--task-spec PATH` | none | One typed predictor per output, each with its own instruction for GEPA to rewrite and its own feedback. Replaces `--input-keys`/`--output-keys`. See [Multi-predictor task specs](#multi-predictor-task-specs) |
 | Component selection (`component_selector`) | `--component-selector round_robin\|all` | round_robin | With several predictors, `round_robin` rewrites one per iteration and `all` rewrites every predictor from the same minibatch |
 | Pareto frontier (`gepa_kwargs["frontier_type"]`) | `--frontier-type instance\|objective\|hybrid\|cartesian` | instance | `objective` keeps the best candidate per predictor score, `hybrid` keeps both per-row and per-predictor winners, `cartesian` keeps per-row-per-predictor winners. All but `instance` need `--task-spec`, whose metric returns `objective_scores` |
+
+Rows are split on `--split-key`: train and dev rows match `--train-split` and
+`--dev-split` exactly, holdout rows match `holdout` in any letter case. A train
+or dev split that names the holdout (`--dev-split Holdout`), or a dev split equal
+to the train split, is refused (`split-invalid`) before any provider call, and the
+runtime asserts that no holdout row is a train or dev row.
 
 `--seed-instructions`, `--evaluate-holdout`, `--match-mode`, and `--task-spec`
 act on the built-in scaffold. A `--program-bridge` owns its own seed program,
@@ -192,7 +210,8 @@ What a spec run adds to the artifacts:
   baseline and optimized, and `delta_by_predictor`. Rows keep expected and
   predicted outputs only, with label sets as label lists.
 - `--seed-instructions` accepts a `{predictor: text}` object keyed by spec name
-  (`urgency`) or DSPy name (`urgency.predict`), as well as `best-so-far.json`.
+  (`urgency`) or DSPy name (`urgency.predict`), as well as a copy of
+  `best-so-far.json`.
 
 ### Worked example: the Facility Support Analyzer
 
@@ -233,14 +252,16 @@ tail -f .understudy/optimize-workload/dspy-gepa/events.jsonl | jq -c '{seq, elap
 ```
 
 `--progress` prints the same story as terminal lines (default when stderr is a
-terminal). Each event carries `seq`, `run_id`, `at`, `elapsed_s`, and `event`:
+terminal). The CLI then passes the runtime's stderr straight through to the
+terminal, so the `stderr` field of the returned adapter payload is empty. Each
+event carries `seq`, `run_id`, `at`, `elapsed_s`, and `event`:
 
 | Event | Fields of note |
 |---|---|
 | `run-started` | models, `spend_enforcement`, `approved_budget_usd`, caps, `rounds`, `match_mode` |
 | `data-loaded` | `train`, `dev`, `holdout` counts |
 | `phase` | `name`: `baseline`, `optimizing`, `optimization-finished`, `evaluating-holdout` |
-| `seeded`, `stop-file-cleared` | the instructions the climb started from; a stale `STOP` was removed |
+| `seeded`, `stop-file-cleared`, `best-so-far-cleared` | the instructions the climb started from; a stale `STOP` was removed; another config's `best-so-far.json` was removed |
 | `round-started`, `round-finished` | `round`, `seed_val_score`, `best_val_score`, `gain`, `metric_calls`, `stopped_by_stop_file` |
 | `call-completed`, `call-failed` | `call_id`, `role`, `model`, tokens, `call_cost_usd`, `price_source`, running `attributed_cost_usd` and `reserved_upper_bound_usd` |
 | `budget-blocked` | the reservation that would have crossed the cap |

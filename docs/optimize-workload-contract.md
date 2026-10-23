@@ -149,11 +149,16 @@ Required behavior:
   token-price basis before resolving auth. Pass auth only through the child
   environment, disable client-side retries, and reserve a conservative
   price-basis upper bound before every request. Stop before a reservation could cross the
-  cap; settle a completed call's reservation to its attributed cost once its usage is
-  known (in-flight and usage-ambiguous calls keep their full reservation); fail closed when usage is missing (including zero input and zero output
+  cap; settle a completed call's reservation to a conservative billable bound once its
+  usage is known (the larger of output and total minus input, plus separately reported
+  reasoning when the total adds nothing, plus reported cache writes; never above the
+  reservation), while in-flight and usage-ambiguous calls keep their full reservation;
+  fail closed when usage is missing (including zero input and zero output
   tokens) or exceeds the reservation, and refuse every later reservation in
-  that run. Run
-  train/dev rows only, exclude holdout rows, and write owner-only candidate,
+  that run, latching the refusal under the same lock as the reservation. Run
+  train/dev rows only, exclude holdout rows (refuse a train or dev split that names
+  the holdout, or equal train and dev splits, and assert the rows are disjoint before
+  any provider call), and write owner-only candidate,
   proof, and terminal run-state artifacts with reservation and attribution
   evidence. The attribution is not a provider-invoice claim. The runtime is
   exactly `dspy==3.4.1`, `gepa[dspy]==0.1.4`, and `cloudpickle==3.1.2`, with

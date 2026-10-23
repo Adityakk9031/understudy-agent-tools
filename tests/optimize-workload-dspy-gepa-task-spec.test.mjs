@@ -710,7 +710,7 @@ import argparse
 args = argparse.Namespace(rounds="1", proposals_per_iteration="1", stop_after_stale=None, proposer_max_chars=None,
     stop_at_score=None, max_minutes=None, min_round_gain="0", match_mode="exact", proposer_skill=[],
     seed_instructions=None, frontier_type="instance", task_spec=None, program_bridge=None, module=None,
-    input_keys="q", output_keys="a", evaluate_holdout=False, no_spend_ledger=False)
+    input_keys="q", output_keys="a", evaluate_holdout=False, no_spend_ledger=False, train_split="train", dev_split="dev")
 rt.validate_search_options(args)
 print(json.dumps({"module": args.module, "task_spec": args.task_spec_data, "keys": [args.input_keys, args.output_keys]}))
 `);
